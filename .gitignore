@@ -3,6 +3,7 @@ config.json
 
 # node topology (may contain private node addresses) — use POOL_JSON secret
 pool.json
+ranked_pool.json
 
 # runtime probe artifacts
 tc_*.json

@@ -17,8 +17,9 @@ Fast parallel liveness test (seconds, not minutes):
 
 Output:
   config.json — sing-box config with HTTP inbound on 127.0.0.1:8080 and a
-  urltest POOL of the alive, best-scored nodes (sing-box auto-picks fastest;
-  on failure _restart_proxy reboots sing-box and urltest re-selects).
+  urltest POOL of the alive, best-scored nodes wrapped in a selector "proxy";
+  main.py pins a specific purity-ranked node per retry via the Clash API.
+  ranked_pool.json — the pool order (tag/name/ip/kind/risk) main.py follows.
 
 Env: SUB_URL (required).
 """
@@ -35,6 +36,16 @@ PROBE_URL = "https://www.gstatic.com/generate_204"
 NODE_TIMEOUT = 8
 ASN_TIMEOUT = 6
 MAX_POOL = 25
+# Cap proxycheck.io free tier usage (100/day no key). We only purity-check
+# this many unique exit IPs; anything beyond is left "unchecked" and ranked
+# by IP type alone.
+PURITY_CHECK_LIMIT = 30
+# proxycheck risk score (0-100) at/above which a node is demoted. 66 is their
+# "high risk" threshold; heavily-abused exits typically score 75+.
+PURITY_RISK_REJECT = 66
+# Checked pool order is written here; main.py pins one node per retry attempt
+# via the Clash API instead of relying on urltest's latency-only choice.
+RANKED_POOL_FILE = "ranked_pool.json"
 
 SKIP_KEYWORDS = ["剩余流量", "距离下次", "套餐到期", "流量剩余", "重置剩余"]
 
@@ -357,6 +368,34 @@ def classify_ip(ip):
         return "unknown", ""
 
 # ==========================================================================
+# IP purity (risk) check via proxycheck.io free tier (no API key, 100/day)
+# ==========================================================================
+
+def purity_risk(ip):
+    """Return proxycheck.io risk score (0-100) for an IP, or None on failure.
+
+    `proxy: yes` is expected for every node (they ARE proxies), so we only
+    look at the risk score and recent attack history — those capture the
+    "dirty" exits that Cloudflare Turnstile refuses to let through. Queried
+    from the runner directly, not through the node."""
+    try:
+        req = urllib.request.Request(
+            f"http://proxycheck.io/v2/{ip}?vpn=3&risk=1&seen=1&days=7&tag=renew",
+            headers={"User-Agent": "curl/8"})
+        d = json.loads(urllib.request.urlopen(req, timeout=8).read().decode())
+        if d.get("status") != "ok":
+            return None
+        info = d.get(ip) or {}
+        if "risk" not in info:
+            return None
+        try:
+            return max(0, min(100, int(info["risk"])))
+        except (TypeError, ValueError):
+            return None
+    except Exception:
+        return None
+
+# ==========================================================================
 # Main: parallel probe via one sing-box + clash_api
 # ==========================================================================
 
@@ -542,23 +581,60 @@ def main():
     score = {"residential": 0, "isp": 1, "unknown": 2, "datacenter": 3}
     reachable.sort(key=lambda x: score.get(x[3], 2))
 
-    print(f"\n=== {len(reachable)} reachable (sorted) ===")
-    for name, ob, ip, kind, org in reachable:
-        print(f"  {kind:12s} {ip:16s} {name[:34]} ({org[:28]})")
+    # De-duplicate by exit IP: this airport re-uses the same exit for many
+    # node entries, and a pool full of aliases of one IP gives retries zero
+    # diversity (observed: 3 consecutive attempts all exited 23.237.50.27).
+    seen_ips = set()
+    deduped = []
+    for r in reachable:
+        if r[2] in seen_ips:
+            continue
+        seen_ips.add(r[2])
+        deduped.append(r)
+    print(f"\n=== {len(reachable)} reachable, {len(deduped)} unique exit IPs ===")
+
+    # Purity check on unique exit IPs. proxycheck free tier: 100/day, so cap.
+    check_ips = [r[2] for r in deduped[:PURITY_CHECK_LIMIT]]
+    risks = {}
+    if check_ips:
+        print(f"Purity check (proxycheck.io) on {len(check_ips)} unique exit IPs...")
+        with ThreadPoolExecutor(max_workers=min(8, len(check_ips))) as ex:
+            risks = dict(zip(check_ips, ex.map(purity_risk, check_ips)))
+        unchecked = sum(1 for v in risks.values() if v is None)
+        if unchecked == len(risks):
+            print("  ⚠️ purity API unreachable/limit hit — ranking by IP type only")
+
+    scored = []
+    for name, ob, ip, kind, org in deduped:
+        risk = risks.get(ip)
+        scored.append((name, ob, ip, kind, org, risk))
+        print(f"  {kind:12s} risk={'??' if risk is None else f'{risk:3d}'}  "
+              f"{ip:16s} {name[:30]} ({org[:22]})")
 
     # IMPORTANT: the urltest group selects the LOWEST-LATENCY node, not the
-    # best-scored one. Datacenter IPs fail Cloudflare Turnstile, so keep them
-    # OUT of the pool whenever residential/isp nodes exist.
-    non_dc = [r for r in reachable if r[3] != "datacenter"]
-    pool_source = non_dc if non_dc else reachable
-    pool = pool_source[:MAX_POOL]
+    # best-scored one. Datacenter IPs and high-risk ("dirty") exits fail
+    # Cloudflare Turnstile, so keep them OUT of the pool whenever cleaner
+    # nodes exist. Final order: kind first, then lowest risk.
+    clean = [s for s in scored
+             if s[3] != "datacenter"
+             and (s[5] is None or s[5] < PURITY_RISK_REJECT)]
+    rest = [s for s in scored if s not in clean]
+    ranked = sorted(clean, key=lambda s: (score.get(s[3], 2), s[5] if s[5] is not None else 50))
+    ranked += sorted(rest, key=lambda s: (score.get(s[3], 2), s[5] if s[5] is not None else 50))
+    pool = (ranked if clean else ranked)[:MAX_POOL]
+
     outbounds = []
-    for i, (name, ob, ip, kind, org) in enumerate(pool, 1):
+    for i, (name, ob, ip, kind, org, _risk) in enumerate(pool, 1):
         ob = dict(ob); ob["tag"] = f"node-{i}"
         outbounds.append(ob)
-    outbounds.append({"type": "urltest", "tag": "proxy",
+    # "urltest auto" picks lowest latency (fallback), "proxy" selector lets
+    # main.py pin a specific purity-ranked node per retry via the Clash API.
+    outbounds.append({"type": "urltest", "tag": "auto",
                       "outbounds": [f"node-{i}" for i in range(1, len(pool) + 1)],
                       "url": PROBE_URL, "interval": "30s"})
+    outbounds.append({"type": "selector", "tag": "proxy",
+                      "outbounds": ["auto"] + [f"node-{i}" for i in range(1, len(pool) + 1)],
+                      "default": "auto"})
     outbounds.append({"type": "direct", "tag": "direct"})
 
     config = {
@@ -567,9 +643,17 @@ def main():
                       "listen": LISTEN_HOST, "listen_port": LISTEN_PORT}],
         "outbounds": outbounds,
         "route": {"final": "proxy"},
+        "experimental": {"clash_api": {"external_controller": f"127.0.0.1:{CLASH_API_PORT}"}},
     }
     with open("config.json", "w") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
+
+    # Ranked pool metadata for main.py's per-attempt node pinning.
+    with open(RANKED_POOL_FILE, "w") as f:
+        json.dump([{"tag": f"node-{i}", "name": name, "ip": ip,
+                    "kind": kind, "risk": risk}
+                   for i, (name, ob, ip, kind, org, risk) in enumerate(pool, 1)],
+                  f, ensure_ascii=False, indent=1)
 
     best = pool[0]
     print(f"\n✅ config.json written: {len(pool)}-node urltest pool.")

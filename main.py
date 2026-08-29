@@ -6,6 +6,7 @@ import json
 import re
 import time
 import subprocess
+import urllib.request
 from datetime import datetime, timedelta, timezone
 import requests
 from seleniumbase import SB
@@ -405,6 +406,61 @@ def _restart_proxy():
                 shown += 1
     except Exception:
         pass
+
+def _pin_pool_node(attempt: int) -> None:
+    """Pin the selector "proxy" to the purity-ranked node for this attempt.
+
+    auto_proxy.py ranks unique exit IPs by type (residential > isp > dc) and
+    proxycheck.io risk score into ranked_pool.json. Attempt N uses rank N;
+    beyond the pool we fall back to the latency-based urltest group "auto".
+    This replaces blind urltest re-rolls that kept picking the same
+    Turnstile-blocked exit IP."""
+    if not os.path.exists("ranked_pool.json"):
+        print("   ⚠️ ranked_pool.json 缺失，无法固定节点（沿用 urltest 自动选择）")
+        return
+    try:
+        pool = json.load(open("ranked_pool.json", encoding="utf-8"))
+    except Exception as e:
+        print(f"   ⚠️ 读取 ranked_pool.json 失败: {e}")
+        return
+    if not pool:
+        return
+    i = min(attempt - 1, len(pool) - 1) if attempt <= len(pool) else None
+    if i is None:
+        target, expect = "auto", ""
+        print(f"   第 {attempt} 次尝试超出节点池，回退到 urltest 自动选节点")
+    else:
+        target, expect = pool[i]["tag"], pool[i].get("ip", "")
+        print(f"   📌 固定使用节点 {target}（排名 {i + 1}/{len(pool)}: "
+              f"{pool[i].get('name', '?')[:40]}, {pool[i].get('kind')}, "
+              f"risk={pool[i].get('risk')}）")
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:9099/proxies/proxy",
+            data=json.dumps({"name": target}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="PUT")
+        urllib.request.urlopen(req, timeout=5).read()
+    except Exception as e:
+        print(f"   ⚠️ Clash API 固定节点失败（{e}），沿用当前选择")
+        return
+    if not expect:
+        return
+    # 校验出口 IP 确实切换到了目标节点
+    for _ in range(8):
+        time.sleep(1.5)
+        try:
+            ph = urllib.request.ProxyHandler({"http": "http://127.0.0.1:8080",
+                                              "https": "http://127.0.0.1:8080"})
+            ip = urllib.request.build_opener(ph).open(
+                urllib.request.Request("https://api.ip.sb/ip",
+                                       headers={"User-Agent": "curl/8"}),
+                timeout=8).read().decode().strip()
+            if ip == expect:
+                return
+        except Exception:
+            pass
+    print(f"   ⚠️ 出口 IP 未在 12 秒内切换到 {expect}，继续按当前节点尝试")
 
 def _switch_to_turnstile_frame(sb):
     """切入页面上的 Turnstile iframe，返回是否成功。"""
@@ -1272,6 +1328,8 @@ def main():
             print(f"  ── 节点尝试 {attempt}/{max_attempts} ──")
             if attempt > 1:
                 _restart_proxy()   # 换池子里另一个节点再试
+            if IS_PROXY:
+                _pin_pool_node(attempt)  # 按纯度排名固定本次使用的节点
             if _run_account(sb_kwargs, email, pwd):
                 acc_ok = True
                 break

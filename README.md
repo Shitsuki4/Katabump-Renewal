@@ -6,9 +6,9 @@
 
 Katabump 登录页有 Cloudflare Turnstile 人机验证，续期时还有 ALTCHA 验证。GitHub Actions runner 是数据中心 IP，直连通过验证的概率极低，所以流程是：
 
-1. （推荐）`SUB_URL` 模式：`auto_proxy.py` 抓取订阅，用单个 sing-box 并行探测所有节点连通性，再并行取存活节点的出口 IP，按住宅/ISP 优先、排除数据中心 IP 排序，生成 urltest 多节点池配置的 `config.json`。
+1. （推荐）`SUB_URL` 模式：`auto_proxy.py` 抓取订阅，用单个 sing-box 并行探测所有节点连通性，再并行取存活节点的出口 IP，按出口 IP 去重后做 IP 纯净度检测（proxycheck.io 风险分，高风险的脏 IP 过不了 Cloudflare Turnstile，会被排到队尾），按 住宅 > ISP > 数据中心、风险分从低到高排序，生成带 selector 的 `config.json` 和排序表 `ranked_pool.json`。
 2. 启动 sing-box 作为本机 HTTP 代理（127.0.0.1:8080），SeleniumBase 无头浏览器走代理完成登录 + 续期。
-3. 某节点续期失败时自动重启 sing-box，urltest 重新探测并切换到池内其他节点重试。
+3. 每个续期尝试都会通过 Clash API 把 selector 固定到纯度排名对应的那一个节点（第 1 次用排名 1，第 2 次用排名 2……），保证每次重试都换一个不同的干净出口；排名用尽后回退到 urltest 延迟自动选择。
 4. 结果通过 Telegram 推送，截图/日志存入 Actions Artifacts。
 
 ## Secrets 配置
@@ -65,4 +65,5 @@ Katabump 登录页有 Cloudflare Turnstile 人机验证，续期时还有 ALTCHA
 ## 注意事项
 
 - 节点测活必须在 runner 真实环境下进行：很多机场封 GitHub/Azure 的 IP，本地能连的节点在 runner 上未必通，反之亦然。
-- 仓库 `.gitignore` 已忽略运行期生成的 `config.json`、`pool.json`、`singbox.log` 等含敏感信息的文件。
+- IP 纯净度检测走 proxycheck.io 免 key 额度（100 次/天），只对去重后的前 30 个出口 IP 检测；接口不可用时自动降级为仅按 IP 类型排序，不影响主流程。
+- 仓库 `.gitignore` 已忽略运行期生成的 `config.json`、`pool.json`、`ranked_pool.json`、`singbox.log` 等含敏感信息的文件。

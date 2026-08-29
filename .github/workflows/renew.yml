@@ -131,4 +131,5 @@ jobs:
             probe_sb.log
             probe_cfg.json
             config.json
+            ranked_pool.json
           if-no-files-found: ignore
