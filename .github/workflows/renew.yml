@@ -123,6 +123,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: renew-artifacts
+          retention-days: 7
           path: |
             *.png
             screenshots/
