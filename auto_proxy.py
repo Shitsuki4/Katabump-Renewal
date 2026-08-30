@@ -55,6 +55,16 @@ RANKED_POOL_FILE = "ranked_pool.json"
 
 SKIP_KEYWORDS = ["剩余流量", "距离下次", "套餐到期", "流量剩余", "重置剩余"]
 
+# uTLS fingerprints sing-box 1.13.x actually knows. Subscriptions circulate
+# made-up values like fp=unsafe; a single such node makes `sing-box check`
+# reject the WHOLE probe config (run 31: 495 nodes lost to one bad one).
+KNOWN_UTLS_FINGERPRINTS = {
+    "", "chrome", "firefox", "safari", "ios", "android", "edge", "360",
+    "qq", "random", "randomized", "chrome_psk", "chrome_pske",
+    "chrome_padding_psk", "chrome_padding_pske", "chrome_psk_shuffle",
+    "chrome_pades_padding_psk", "chrome_final_psk", "chrome_final_pske",
+}
+
 # ==========================================================================
 # Format sniffing + parsing
 # ==========================================================================
@@ -447,6 +457,12 @@ def _probe_once(sub_url):
         # would make sing-box refuse the whole config, killing the probe.
         tr = (ob.get("transport") or {}).get("type", "")
         if tr and tr not in ("ws", "grpc", "http", "quic", "h2mux"):
+            continue
+        # Same for unknown uTLS fingerprints (fp=unsafe is circulating).
+        tls = ob.get("tls") or {}
+        utls_fp = ((tls.get("utls") or {}).get("fingerprint") or "")
+        if utls_fp not in KNOWN_UTLS_FINGERPRINTS:
+            print(f"  skip: {name[:40]} (unknown uTLS fingerprint '{utls_fp}')")
             continue
         nodes.append((name, ob))
     print(f"{len(nodes)} nodes to probe in parallel.\n")
