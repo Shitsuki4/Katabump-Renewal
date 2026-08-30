@@ -126,10 +126,9 @@ jobs:
           retention-days: 7
           path: |
             *.png
+            *.log
             screenshots/
-            singbox.log
-            probe_sb.log
-            probe_cfg.json
+            latest_logs/
             config.json
             ranked_pool.json
           if-no-files-found: ignore

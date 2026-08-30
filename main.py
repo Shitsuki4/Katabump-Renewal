@@ -10,6 +10,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 import requests
 from seleniumbase import SB
+from selenium.common.exceptions import WebDriverException
 
 # 从环境变量获取账号密码和 TG 配置
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""        # tg通知 chat id(可选)
@@ -357,6 +358,30 @@ def _xdotool_click(x: int, y: int):
         subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+
+
+def dump_driver_log(path="chromedriver.log"):
+    """Persist the chromedriver service log (if any) into an artifact path.
+
+    SeleniumBase writes chromedriver.log under the latest_savedfile logged
+    sessions dir; when absent this is a no-op. Artifact upload picks the
+    file up via the *.log globs, so crashes leave a post-mortem behind."""
+    import glob
+    cands = (glob.glob(os.path.join("latest_logs", "**", "chromedriver.log"), recursive=True)
+             + glob.glob(os.path.join("*", "chromedriver.log"))
+             + glob.glob("chromedriver.log"))
+    for src in cands:
+        try:
+            with open(src, "rb") as f:
+                data = f.read()
+            with open(path, "wb") as f:
+                f.write(data)
+            print(f"  📎 chromedriver 日志已保存到 {path}（来源 {src}, {len(data)} bytes）")
+            return True
+        except Exception:
+            continue
+    print("  （未找到 chromedriver.log）")
+    return False
 
 
 def _restart_proxy():
@@ -1293,6 +1318,19 @@ def _run_account(sb_kwargs, email, pwd) -> bool:
                 print("\n❌ 登录失败，终止该账号续期操作。")
                 send_tg_message("❌", "登录失败", "未知")
                 return False
+    except WebDriverException as e:
+        # chromedriver died mid-run (run 29: Turnstile never rendered on
+        # risk>=66 exits, driver refused the next command and every later
+        # call failed with Connection refused, losing all diagnostics).
+        # Grab what we can before the browser context is gone for good.
+        print(f"\n💀 浏览器/驱动会话中断: {type(e).__name__}: {str(e)[:300]}")
+        try:
+            dump_driver_log("driver_crash.log")
+        except Exception:
+            pass
+        send_tg_message("💀", "浏览器会话中断",
+                        f"{type(e).__name__}: {str(e)[:150]}")
+        return False
     except Exception as e:
         print(f"\n❌ 账号 {email} 处理异常: {e}")
         send_tg_message("❌", f"处理异常: {e}", "未知")

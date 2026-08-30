@@ -21,6 +21,10 @@ Output:
   main.py pins a specific purity-ranked node per retry via the Clash API.
   ranked_pool.json — the pool order (tag/name/ip/kind/risk) main.py follows.
 
+  If no low-risk exit survives two probe passes (dirty = proxycheck risk>=66
+  or datacenter), the script exits 3 without writing a pool: Cloudflare
+  refuses to render Turnstile on such exits, so browser renewal is doomed.
+
 Env: SUB_URL (required).
 """
 
@@ -43,6 +47,8 @@ PURITY_CHECK_LIMIT = 30
 # proxycheck risk score (0-100) at/above which a node is demoted. 66 is their
 # "high risk" threshold; heavily-abused exits typically score 75+.
 PURITY_RISK_REJECT = 66
+# Exit-kind ranking (lower is better) used to order the pool.
+KIND_SCORE = {"residential": 0, "isp": 1, "unknown": 2, "datacenter": 3}
 # Checked pool order is written here; main.py pins one node per retry attempt
 # via the Clash API instead of relying on urltest's latency-only choice.
 RANKED_POOL_FILE = "ranked_pool.json"
@@ -399,12 +405,11 @@ def purity_risk(ip):
 # Main: parallel probe via one sing-box + clash_api
 # ==========================================================================
 
-def main():
-    sub_url = os.environ.get("SUB_URL", "").strip()
-    if not sub_url:
-        print("SUB_URL not set, cannot auto-select proxy.")
-        sys.exit(2)
-
+def _probe_once(sub_url):
+    """One pass: fetch subscription -> parallel liveness probe -> exit-IP
+    fetch -> classify -> purity check. Returns scored tuples
+    (name, ob, ip, kind, org, risk), or None when nothing probed alive
+    (transient failure the caller may retry)."""
     print(f"Fetching subscription: {sub_url}")
     items = fetch_subscription(sub_url)
     print(f"Parsed {len(items)} candidate nodes.\n")
@@ -447,7 +452,7 @@ def main():
     print(f"{len(nodes)} nodes to probe in parallel.\n")
 
     if not nodes:
-        print("❌ No usable nodes."); sys.exit(3)
+        print("❌ No usable nodes."); return None
 
     # Build ONE config: all outbounds as node-N + urltest + clash_api.
     outbounds = []
@@ -546,7 +551,7 @@ def main():
         print(f"  {'OK  ' if tag in alive else 'FAIL'} {tag:8s} {name[:40]}")
 
     if not alive:
-        print("\n❌ No reachable node."); sys.exit(3)
+        print("\n❌ No reachable node."); return None
 
     # For alive nodes, fetch exit IP via per-node sing-box. All instances run
     # in PARALLEL (each on its own port) and IP queries go out concurrently,
@@ -576,10 +581,9 @@ def main():
         else:
             print(f"  {'no-ip':12s} {'-':16s} {name[:34]}")
     if not reachable:
-        print("\n❌ Alive nodes could not fetch exit IP."); sys.exit(3)
+        print("\n❌ Alive nodes could not fetch exit IP."); return None
 
-    score = {"residential": 0, "isp": 1, "unknown": 2, "datacenter": 3}
-    reachable.sort(key=lambda x: score.get(x[3], 2))
+    reachable.sort(key=lambda x: KIND_SCORE.get(x[3], 2))
 
     # De-duplicate by exit IP: this airport re-uses the same exit for many
     # node entries, and a pool full of aliases of one IP gives retries zero
@@ -610,18 +614,53 @@ def main():
         scored.append((name, ob, ip, kind, org, risk))
         print(f"  {kind:12s} risk={'??' if risk is None else f'{risk:3d}'}  "
               f"{ip:16s} {name[:30]} ({org[:22]})")
+    return scored
+
+
+def main():
+    sub_url = os.environ.get("SUB_URL", "").strip()
+    if not sub_url:
+        print("SUB_URL not set, cannot auto-select proxy.")
+        sys.exit(2)
+
+    # Residential/ISP exits flap: run 29 (2026-08-30) probed a subscription
+    # snapshot where every reachable exit scored proxycheck risk=66
+    # (Turnstile-bait) while the clean residential lines were merely down at
+    # probe time. Retry the whole probe once before declaring the pool doomed.
+    clean = []
+    scored = []
+    for attempt in (1, 2):
+        scored = _probe_once(sub_url)
+        if scored is None:
+            clean = []
+        else:
+            clean = [s for s in scored
+                     if s[3] != "datacenter"
+                     and (s[5] is None or s[5] < PURITY_RISK_REJECT)]
+        if clean:
+            break
+        if attempt == 1:
+            print(f"\n⚠️ 第 1 轮探测没有发现任何低风险出口"
+                  f"（全是 risk>={PURITY_RISK_REJECT} 的脏 IP / 机房 IP，或全部探活失败）"
+                  f"— 5 秒后重试一轮...")
+            time.sleep(5)
+
+    if not clean:
+        print(f"\n❌ 两轮探测后仍无低风险出口（全是 risk>={PURITY_RISK_REJECT} 的脏 IP / 机房 IP）。")
+        print("   这些出口打开登录页只会得到 1x1 隐身 Turnstile（拒绝渲染），续期必然失败，")
+        print("   因此直接退出，不烧掉整轮浏览器尝试。建议检查订阅里住宅/ISP 节点是否下线。")
+        sys.exit(3)
 
     # IMPORTANT: the urltest group selects the LOWEST-LATENCY node, not the
     # best-scored one. Datacenter IPs and high-risk ("dirty") exits fail
     # Cloudflare Turnstile, so keep them OUT of the pool whenever cleaner
-    # nodes exist. Final order: kind first, then lowest risk.
-    clean = [s for s in scored
-             if s[3] != "datacenter"
-             and (s[5] is None or s[5] < PURITY_RISK_REJECT)]
+    # nodes exist. Final order: kind first, then lowest risk. Dirty nodes are
+    # still appended after the clean ones (urltest fallback / late attempts),
+    # but an all-dirty pool can no longer happen: main() exits first.
     rest = [s for s in scored if s not in clean]
-    ranked = sorted(clean, key=lambda s: (score.get(s[3], 2), s[5] if s[5] is not None else 50))
-    ranked += sorted(rest, key=lambda s: (score.get(s[3], 2), s[5] if s[5] is not None else 50))
-    pool = (ranked if clean else ranked)[:MAX_POOL]
+    ranked = sorted(clean, key=lambda s: (KIND_SCORE.get(s[3], 2), s[5] if s[5] is not None else 50))
+    ranked += sorted(rest, key=lambda s: (KIND_SCORE.get(s[3], 2), s[5] if s[5] is not None else 50))
+    pool = ranked[:MAX_POOL]
 
     outbounds = []
     for i, (name, ob, ip, kind, org, _risk) in enumerate(pool, 1):
