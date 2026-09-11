@@ -470,6 +470,17 @@ def purity_risk(ip):
     except Exception:
         return None
 
+
+def rank_nodes_by_purity(scored):
+    """Order reachable nodes by exit quality, then by proxycheck risk."""
+    return sorted(
+        scored,
+        key=lambda node: (
+            KIND_SCORE.get(node[3], 2),
+            node[5] if node[5] is not None else 50,
+        ),
+    )
+
 # ==========================================================================
 # Main: parallel probe via one sing-box + clash_api
 # ==========================================================================
@@ -713,43 +724,32 @@ def main():
         print("SUB_URL not set, cannot auto-select proxy.")
         sys.exit(2)
 
-    # Residential/ISP exits flap: run 29 (2026-08-30) probed a subscription
-    # snapshot where every reachable exit scored proxycheck risk=66
-    # (Turnstile-bait) while the clean residential lines were merely down at
-    # probe time. Retry the whole probe once before declaring the pool doomed.
-    clean = []
-    scored = []
+    # Retry once when no node is reachable yet. Residential/ISP exits often
+    # flap, while a temporary empty probe result does not tell us anything
+    # about node purity.
+    scored = None
     for attempt in (1, 2):
         scored = _probe_once(sub_url)
-        if scored is None:
-            clean = []
-        else:
-            clean = [s for s in scored
-                     if s[3] != "datacenter"
-                     and (s[5] is None or s[5] < PURITY_RISK_REJECT)]
-        if clean:
+        if scored:
             break
         if attempt == 1:
-            print(f"\n⚠️ 第 1 轮探测没有发现任何低风险出口"
-                  f"（全是 risk>={PURITY_RISK_REJECT} 的脏 IP / 机房 IP，或全部探活失败）"
-                  f"— 5 秒后重试一轮...")
+            print("\n⚠️ 第 1 轮没有拿到可达节点，5 秒后重试一轮...")
             time.sleep(5)
 
-    if not clean:
-        print(f"\n❌ 两轮探测后仍无低风险出口（全是 risk>={PURITY_RISK_REJECT} 的脏 IP / 机房 IP）。")
-        print("   这些出口打开登录页只会得到 1x1 隐身 Turnstile（拒绝渲染），续期必然失败，")
-        print("   因此直接退出，不烧掉整轮浏览器尝试。建议检查订阅里住宅/ISP 节点是否下线。")
+    if not scored:
+        print("\n❌ 两轮探测后仍无可达节点。")
         sys.exit(3)
 
-    # IMPORTANT: the urltest group selects the LOWEST-LATENCY node, not the
-    # best-scored one. Datacenter IPs and high-risk ("dirty") exits fail
-    # Cloudflare Turnstile, so keep them OUT of the pool whenever cleaner
-    # nodes exist. Final order: kind first, then lowest risk. Dirty nodes are
-    # still appended after the clean ones (urltest fallback / late attempts),
-    # but an all-dirty pool can no longer happen: main() exits first.
-    rest = [s for s in scored if s not in clean]
-    ranked = sorted(clean, key=lambda s: (KIND_SCORE.get(s[3], 2), s[5] if s[5] is not None else 50))
-    ranked += sorted(rest, key=lambda s: (KIND_SCORE.get(s[3], 2), s[5] if s[5] is not None else 50))
+    # Always attempt the best available exits in purity order. Prefer
+    # residential and ISP nodes, then low proxycheck risk. If the subscription
+    # has no clean exit, still put its least-bad candidates ahead instead of
+    # aborting before the renewal attempt.
+    ranked = rank_nodes_by_purity(scored)
+    clean = [s for s in ranked
+             if s[3] != "datacenter"
+             and (s[5] is None or s[5] < PURITY_RISK_REJECT)]
+    if not clean:
+        print(f"\n⚠️ 未发现低风险非机房出口，将按纯度排序后继续尝试。")
     pool = ranked[:MAX_POOL]
 
     outbounds = []

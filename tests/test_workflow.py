@@ -58,6 +58,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(config["experimental"]["clash_api"]["external_controller"], "127.0.0.1:9099")
         self.assertEqual([item["tag"] for item in pool], ["node-1"])
 
+    def test_rank_nodes_by_purity_prefers_clean_residential_nodes(self):
+        datacenter = ("dc", {"type": "direct"}, "203.0.113.10", "datacenter", "Example DC", 10)
+        residential = ("home", {"type": "direct"}, "198.51.100.20", "residential", "Example ISP", 70)
+        isp = ("isp", {"type": "direct"}, "198.51.100.30", "isp", "Example ISP", 5)
+        residential_high_risk = ("home-risk", {"type": "direct"}, "198.51.100.40", "residential", "Example ISP", 80)
+
+        ranked = auto_proxy.rank_nodes_by_purity([
+            datacenter,
+            residential_high_risk,
+            residential,
+            isp,
+        ])
+
+        self.assertEqual(
+            [node[0] for node in ranked],
+            ["home", "home-risk", "isp", "dc"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
