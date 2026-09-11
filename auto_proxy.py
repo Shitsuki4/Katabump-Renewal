@@ -28,7 +28,7 @@ Output:
 Env: SUB_URL (required).
 """
 
-import os, sys, json, time, base64, subprocess, urllib.request, urllib.error
+import os, sys, json, time, base64, re, subprocess, urllib.request, urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlparse, parse_qs, unquote
 
@@ -152,6 +152,63 @@ def _from_base64(raw):
         if node:
             out.append(("link", node))
     return out
+
+
+def _is_share_link(url):
+    return bool(re.match(r"^[a-z0-9+.-]+://", url.strip(), re.IGNORECASE))
+
+
+def _normalize_node_item(item, index):
+    source, node = item
+    if source == "singbox":
+        outbound = dict(node)
+        outbound.pop("name", None)
+        tag = node.get("name") or f"node-{index}"
+    else:
+        outbound = to_outbound(node, f"node-{index}")
+        tag = node.get("name") or node.get("tag") or f"node-{index}"
+    return tag, outbound
+
+
+def write_single_node_config(nodes):
+    """Write a one-node-per-attempt selector config from a URL or raw link."""
+    if not nodes:
+        raise ValueError("PROXY_URL did not produce any usable nodes")
+    outbounds = []
+    pool = []
+    for index, item in enumerate(nodes, 1):
+        tag, outbound = _normalize_node_item(item, index)
+        if not outbound:
+            continue
+        outbound["tag"] = f"node-{index}"
+        outbounds.append(outbound)
+        pool.append({"tag": outbound["tag"], "name": tag,
+                     "ip": None, "kind": "unknown", "risk": None})
+    if not outbounds:
+        raise ValueError("PROXY_URL did not contain a supported node")
+
+    outbounds.append({"type": "urltest", "tag": "auto",
+                      "outbounds": [item["tag"] for item in pool],
+                      "url": PROBE_URL, "interval": "30s"})
+    outbounds.append({"type": "selector", "tag": "proxy",
+                      "outbounds": ["auto"] + [item["tag"] for item in pool],
+                      "default": "auto"})
+    outbounds.append({"type": "direct", "tag": "direct"})
+    config = {
+        "log": {"level": "info", "timestamp": True},
+        "inbounds": [{"type": "http", "tag": "http-in",
+                      "listen": LISTEN_HOST, "listen_port": LISTEN_PORT}],
+        "outbounds": outbounds,
+        "route": {"final": "proxy"},
+        "experimental": {
+            "clash_api": {"external_controller": f"127.0.0.1:{CLASH_API_PORT}"}
+        },
+    }
+    with open("config.json", "w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, ensure_ascii=False, indent=2)
+    with open(RANKED_POOL_FILE, "w", encoding="utf-8") as pool_file:
+        json.dump(pool, pool_file, ensure_ascii=False, indent=1)
+    print(f"✅ config.json written: {len(pool)}-node PROXY_URL fallback pool.")
 
 # --- share-link parsers (produce clash-ish dicts) ---
 
@@ -331,6 +388,8 @@ def to_outbound(n, tag):
         return ob
     if t == "ss":
         return {"type": "shadowsocks", **base, "method": n.get("cipher"), "password": n.get("password", "")}
+    if t == "shadowsocks":
+        return {"type": "shadowsocks", **base, "method": n.get("method"), "password": n.get("password", "")}
     if t == "vmess":
         ob = {"type": "vmess", **base, "uuid": n.get("uuid", ""),
               "alter_id": int(n.get("alterId", 0)), "security": n.get("cipher", "auto")}
@@ -634,6 +693,21 @@ def _probe_once(sub_url):
 
 
 def main():
+    proxy_url = os.environ.get("PROXY_URL", "").strip()
+    if "--proxy-url" in sys.argv[1:] or os.environ.get("TEST_PROXY_URL_MODE") == "1":
+        if not proxy_url:
+            print("PROXY_URL not set, cannot generate fallback config.")
+            sys.exit(2)
+        share_link_protocols = {"vmess", "vless", "hy2", "trojan", "tuic", "anytls", "ss", "socks5"}
+        proxy_scheme = proxy_url.split("://", 1)[0].lower()
+        if proxy_scheme in share_link_protocols:
+            parsed_node = parse_share_link(proxy_url)
+            nodes = [("link", parsed_node)] if parsed_node else []
+        else:
+            nodes = fetch_subscription(proxy_url)
+        write_single_node_config(nodes)
+        return
+
     sub_url = os.environ.get("SUB_URL", "").strip()
     if not sub_url:
         print("SUB_URL not set, cannot auto-select proxy.")

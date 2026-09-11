@@ -8,6 +8,7 @@ import time
 import subprocess
 import urllib.request
 from datetime import datetime, timedelta, timezone
+import argparse
 import requests
 from seleniumbase import SB
 from selenium.common.exceptions import WebDriverException
@@ -46,7 +47,6 @@ def load_accounts():
         print(f"❌ USERS_JSON 解析失败: {e}")
         return []
 
-ACCOUNTS = load_accounts()
 CURRENT_EMAIL = ""  # 当前正在处理的账号，供 send_tg_message 脱敏
 
 #  Telegram 推送模块
@@ -323,9 +323,10 @@ def js_fill_input(sb, selector: str, text: str):
     (function(){{
         var el = document.querySelector('{selector}');
         if (!el) return;
-        var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-        if (nativeInputValueSetter) {{
-            nativeInputValueSetter.call(el, "{safe_text}");
+        var descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value") ||
+                         Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
+        if (descriptor && descriptor.set) {{
+            descriptor.set.call(el, "{safe_text}");
         }} else {{
             el.value = "{safe_text}";
         }}
@@ -1339,11 +1340,30 @@ def _run_account(sb_kwargs, email, pwd) -> bool:
 
 #  脚本执行入口 (可选代理)
 def main():
+    parser = argparse.ArgumentParser(description="Katabump automatic renewal runner")
+    parser.add_argument(
+        "--validate-config",
+        action="store_true",
+        help="validate account and retry configuration without opening a browser",
+    )
+    parser.add_argument(
+        "--notify-failure",
+        action="store_true",
+        help="send a generic workflow-failure Telegram notification",
+    )
+    args = parser.parse_args()
+
+    if args.validate_config:
+        return validate_config()
+    if args.notify_failure:
+        return notify_workflow_failure()
+
     print("#" * 25)
     print("   katabump 自动登录续期")
     print("#" * 25)
 
-    if not ACCOUNTS:
+    accounts = load_accounts()
+    if not accounts:
         print("❌ 没有可用的账号，退出。")
         raise SystemExit(1)
 
@@ -1357,15 +1377,15 @@ def main():
     else:
         print("🌐 未使用代理，直连访问")
 
-    print(f"👥 共 {len(ACCOUNTS)} 个账号待处理")
+    print(f"👥 共 {len(accounts)} 个账号待处理")
 
     ok_count = 0
-    max_attempts = int(os.environ.get("NODE_ATTEMPTS", "3"))
-    for idx, acc in enumerate(ACCOUNTS, 1):
+    max_attempts = parse_node_attempts()
+    for idx, acc in enumerate(accounts, 1):
         email = acc["email"]
         pwd   = acc["password"]
         print("\n" + "=" * 25)
-        print(f"  处理账号 {idx}/{len(ACCOUNTS)}: {email}")
+        print(f"  处理账号 {idx}/{len(accounts)}: {email}")
         print("=" * 25)
 
         acc_ok = False
@@ -1385,10 +1405,48 @@ def main():
             send_tg_message("❌", "节点尝试均失败", f"{max_attempts} 次不同代理节点")
 
     print("\n" + "#" * 25)
-    print(f"  全部账号处理完毕: {ok_count}/{len(ACCOUNTS)} 成功")
+    print(f"  全部账号处理完毕: {ok_count}/{len(accounts)} 成功")
     print("#" * 25)
-    if ok_count < len(ACCOUNTS):
+    if ok_count < len(accounts):
         raise SystemExit(1)
+
+
+def parse_node_attempts():
+    raw = os.environ.get("NODE_ATTEMPTS", "3").strip()
+    try:
+        attempts = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"NODE_ATTEMPTS must be an integer, got {raw!r}") from exc
+    if attempts < 1:
+        raise ValueError("NODE_ATTEMPTS must be at least 1")
+    return attempts
+
+
+def validate_config():
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 配置校验失败：没有可用账号")
+        return 1
+    try:
+        attempts = parse_node_attempts()
+    except ValueError as exc:
+        print(f"❌ 配置校验失败：{exc}")
+        return 1
+    invalid = [
+        account["email"]
+        for account in accounts
+        if not account["password"]
+    ]
+    if invalid:
+        print(f"❌ 配置校验失败：{len(invalid)} 个账号缺少密码")
+        return 1
+    print(f"✅ 配置校验通过：{len(accounts)} 个账号，最多 {attempts} 次节点尝试")
+    return 0
+
+
+def notify_workflow_failure():
+    send_tg_message("❌", "GitHub Actions 工作流失败", "请打开 Actions 日志查看失败步骤")
+    return 0
 
 if __name__ == "__main__":
     main()

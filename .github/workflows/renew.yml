@@ -9,9 +9,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: katabump-renew
+  cancel-in-progress: false
+
 jobs:
   renew:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: utf-8
 
     steps:
       - uses: actions/checkout@v4
@@ -21,20 +29,37 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
-          cache-dependency-path: ".github/workflows/renew.yml"
+          cache-dependency-path: requirements.txt
 
       - name: Install System & Python Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
-          pip install seleniumbase requests pyyaml
+          pip install -r requirements.txt
           seleniumbase install chromedriver
+
+      - name: Validate accounts and retry settings
+        env:
+          USERS_JSON: ${{ secrets.USERS_JSON }}
+          KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
+          KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
+          NODE_ATTEMPTS: ${{ secrets.NODE_ATTEMPTS || '3' }}
+        run: python main.py --validate-config
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
 
       # ------------------------------------------------------------------
       # 下载 sing-box（无论是否用代理都需要；auto_proxy.py 也依赖它）
       # ------------------------------------------------------------------
       - name: Download sing-box
+        env:
+          SUB_URL: ${{ secrets.SUB_URL }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
         run: |
+          if [ -z "$SUB_URL" ] && [ -z "$PROXY_URL" ]; then
+            exit 0
+          fi
           SINGBOX_VER="1.13.16"
           echo "Downloading sing-box v${SINGBOX_VER}..."
           wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
@@ -45,14 +70,13 @@ jobs:
 
       # ------------------------------------------------------------------
       # 自动选节点：有 SUB_URL 时，抓订阅→测活→住宅IP优先→生成 urltest 池 config.json
-      # 没配 SUB_URL 但配了 PROXY_URL 时，回退到 proxy_handler.py（单节点）
+      # 没配 SUB_URL 但配了 PROXY_URL 时，解析单节点或订阅地址
       # 两者都没配则直连
       # ------------------------------------------------------------------
       - name: Auto-select proxy node (SUB_URL) or fallback (PROXY_URL)
         env:
           SUB_URL: ${{ secrets.SUB_URL }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          POOL_JSON: ${{ secrets.POOL_JSON }}
         run: |
           # 决定 IS_PROXY：SUB_URL 或 PROXY_URL 任一非空即启用代理
           if [ -n "$SUB_URL" ]; then
@@ -63,7 +87,7 @@ jobs:
           elif [ -n "$PROXY_URL" ]; then
             echo "USING_PROXY=true" >> "$GITHUB_ENV"
             echo "=== Fallback mode: PROXY_URL set, generating single-node config ==="
-            python proxy_handler.py
+            python auto_proxy.py --proxy-url
           else
             echo "USING_PROXY=false" >> "$GITHUB_ENV"
             echo "=== Direct mode: no SUB_URL, no PROXY_URL, connecting directly ==="
@@ -77,35 +101,7 @@ jobs:
             echo "Proxy not requested, skipping sing-box startup."
             exit 0
           fi
-          if [ ! -f config.json ]; then
-            echo "❌ config.json missing — node selection failed"
-            exit 1
-          fi
-          echo "Starting sing-box..."
-          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
-          echo "--- waiting for proxy to come up (poll, max 60s) ---"
-          ok=0
-          for i in $(seq 1 30); do
-            if ! pgrep -f "./sing-box" > /dev/null; then
-              echo "❌ sing-box process died early"
-              tail -30 singbox.log || true
-              exit 1
-            fi
-            if curl -s -m 10 -x http://127.0.0.1:8080 https://api.ip.sb/ip; then
-              echo ""
-              echo "  <- proxy OK after ~$((i*2))s"
-              ok=1
-              break
-            fi
-            sleep 2
-          done
-          echo "--- singbox.log (last 30 lines) ---"
-          tail -30 singbox.log || true
-          if [ "$ok" != "1" ]; then
-            echo "❌ proxy connect FAILED — no reachable node in pool within 60s"
-            exit 1
-          fi
-          grep -iE "urltest|selected|node-" singbox.log | tail -5 || true
+          python proxy_runtime.py
 
       - name: Run Renew Script
         env:
@@ -116,19 +112,23 @@ jobs:
           IS_PROXY: ${{ env.USING_PROXY }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          NODE_ATTEMPTS: ${{ secrets.NODE_ATTEMPTS || '3' }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 main.py
 
-      - name: Upload Artifacts
-        if: always()
+      - name: Notify workflow failure
+        if: failure()
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python main.py --notify-failure
+
+      - name: Upload diagnostic screenshots (opt-in)
+        if: ${{ always() && vars.UPLOAD_SCREENSHOTS == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: renew-artifacts
-          retention-days: 7
+          retention-days: 1
           path: |
             *.png
-            *.log
             screenshots/
-            latest_logs/
-            config.json
-            ranked_pool.json
           if-no-files-found: ignore
