@@ -130,7 +130,21 @@ _EXPAND_JS = """
 
 _EXISTS_JS = """
 (function(){
-    return document.querySelector('input[name="cf-turnstile-response"]') !== null;
+    if (document.querySelector('input[name="cf-turnstile-response"]')) return 'input';
+    var frames = document.querySelectorAll('iframe');
+    for (var i = 0; i < frames.length; i++){
+        var s = frames[i].src || '';
+        if (s.indexOf('challenges.cloudflare.com') > -1 || s.indexOf('/turnstile/') > -1)
+            return 'iframe';
+    }
+    return '';
+})()
+"""
+
+# 页面 HTML 里服务端渲染的 Turnstile 容器；与出口 IP 无关
+_TURNSTILE_CONFIGURED_JS = """
+(function(){
+    return document.querySelector('.cf-turnstile, [data-sitekey*="0x"]') !== null;
 })()
 """
 
@@ -428,22 +442,22 @@ def _nudge_turnstile_launcher(sb):
 
 #  人机验证处理（多策略：SeleniumBase UC GUI 点击 + xdotool 物理点击 + iframe 内 JS 点击）
 def handle_turnstile(sb) -> bool:
+    """点击 Turnstile 并等待 token。容器在 HTML 里但 iframe 未渲染时，
+    用回车提交触发 Turnstile 显式 execute（flexible 尺寸初始不渲染），
+    页面跳转证明 token 由 JS 自动注入并随表单提交。"""
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
 
-    # 检查是否已静默通过
     if sb.execute_script(_SOLVED_JS):
         print("✅ 已静默通过")
         return True
 
-    # 记录页面 iframe 布局（诊断用）
     try:
         fm = sb.execute_script(_IFRAME_MAP_JS)
         print(f"  📄 页面 iframe: {fm}")
     except Exception:
         pass
 
-    # 展开 Turnstile 验证框（防止被父容器 overflow:hidden 裁剪）
     for _ in range(3):
         try: sb.execute_script(_EXPAND_JS)
         except Exception: pass
@@ -608,14 +622,27 @@ def login(sb, email, password) -> bool:
     js_fill_input(sb, 'input[name="password"]', password)
     time.sleep(1)
 
-    # 等待 Turnstile 验证框出现（最多 10 秒）
+    # 等待 Turnstile 渲染（最多 12 秒）。
+    # flexible 尺寸下 iframe 可能永不出现，但 HTML 中的 .cf-turnstile 容器
+    # 一定存在；提交一次空表单让浏览器焦点/JS 激活 Turnstile 显式渲染。
     print("⏳ 等待 Turnstile 验证框出现...")
     ts_found = False
-    for i in range(10):
-        if sb.execute_script(_EXISTS_JS):
+    configured = False
+    for i in range(12):
+        state = sb.execute_script(_EXISTS_JS) or ""
+        if state:
             ts_found = True
-            print(f"✅ 检测到 Turnstile（{i+1}s）")
+            print(f"✅ 检测到 Turnstile（{state}，{i+1}s）")
             break
+        if i == 5 and not configured:
+            configured = bool(sb.execute_script(_TURNSTILE_CONFIGURED_JS))
+            if configured:
+                print("  ⚙️ Turnstile 容器存在但 iframe 未渲染；触发一次提交以激活")
+                try:
+                    sb.press_keys('input[name="password"]', '\n')
+                    time.sleep(1)
+                except Exception:
+                    pass
         _nudge_turnstile_launcher(sb)
         try:
             sb.execute_script(_EXPAND_JS)
@@ -628,11 +655,25 @@ def login(sb, email, password) -> bool:
             print("❌ 登录界面的 Turnstile 验证失败")
             sb.save_screenshot("login_turnstile_fail.png")
             return False
+    elif configured:
+        # 容器在但始终未渲染：token 由 Turnstile JS 自动注入 hidden input，
+        # 直接提交（首次提交若缺 token 会重定向 error=captcha，再走 handle_turnstile）。
+        print("ℹ️ Turnstile 容器存在但未渲染，直接提交观察")
     else:
         print("ℹ️ 未检测到 Turnstile")
 
     print("🖱️ 敲击回车提交表单...")
     sb.press_keys('input[name="password"]', '\n')
+
+    # 提交后若被 error=captcha 打回且 Turnstile 这时才渲染，补一次处理
+    time.sleep(2)
+    if "error=" in (sb.get_current_url() or "") and sb.execute_script(_EXISTS_JS):
+        print("↩️ 提交被 captcha 拒绝且 Turnstile 已渲染，重试验证...")
+        if not handle_turnstile(sb):
+            sb.save_screenshot("login_turnstile_fail.png")
+            return False
+        print("🖱️ 重新提交表单...")
+        sb.press_keys('input[name="password"]', '\n')
 
     print("⏳ 等待登录跳转...")
     for _ in range(12):
