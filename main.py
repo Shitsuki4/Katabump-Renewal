@@ -128,32 +128,21 @@ _EXPAND_JS = """
 })()
 """
 
-_EXISTS_JS = """
-(function(){
-    if (document.querySelector('input[name="cf-turnstile-response"]')) return 'input';
-    var frames = document.querySelectorAll('iframe');
-    for (var i = 0; i < frames.length; i++){
-        var s = frames[i].src || '';
-        if (s.indexOf('challenges.cloudflare.com') > -1 || s.indexOf('/turnstile/') > -1)
-            return 'iframe';
-    }
-    return '';
-})()
-"""
+# 注意：轮询用的 JS 用 "return ..." 语句形式，不用 IIFE 表达式。
+# 实测部分 chromedriver/selenium 组合（Chrome 153 + selenium 4.49）对
+# IIFE 表达式语句一律返回 None，会被误判为"未检测到"。
+_EXISTS_JS = ("var i=document.querySelector('input[name=\"cf-turnstile-response\"]');"
+              "if(i)return 'input';"
+              "var f=document.querySelectorAll('iframe');"
+              "for(var k=0;k<f.length;k++){var s=f[k].src||'';"
+              "if(s.indexOf('challenges.cloudflare.com')>-1||s.indexOf('/turnstile/')>-1)return 'iframe';}"
+              "return '';")
 
 # 页面 HTML 里服务端渲染的 Turnstile 容器；与出口 IP 无关
-_TURNSTILE_CONFIGURED_JS = """
-(function(){
-    return document.querySelector('.cf-turnstile, [data-sitekey*="0x"]') !== null;
-})()
-"""
+_TURNSTILE_CONFIGURED_JS = "return document.querySelector('.cf-turnstile, [data-sitekey*=\"0x\"]') !== null;"
 
-_SOLVED_JS = """
-(function(){
-    var i = document.querySelector('input[name="cf-turnstile-response"]');
-    return !!(i && i.value && i.value.length > 20);
-})()
-"""
+_SOLVED_JS = ("var i=document.querySelector('input[name=\"cf-turnstile-response\"]');"
+              "return !!(i && i.value && i.value.length > 20);")
 
 _WININFO_JS = """
 (function(){
@@ -380,6 +369,37 @@ def _xdotool_click(x: int, y: int):
         subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
     except Exception:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+
+
+def _human_warmup(sb):
+    """Turnstile 静默不渲染时模拟人类交互：鼠标轨迹 + 页面滚动。
+
+    Cloudflare 的 managed challenge 在判定自动化特征后可能连交互式
+    widget 都不渲染；真实鼠标事件（X11 层，非 JS 合成）与滚动有时能
+    促使 challenge-platform 重新评估并注入 token。仅在有 DISPLAY 的
+    Linux/本机 GUI 环境生效，失败则安静跳过。"""
+    try:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        w, h = pyautogui.size()
+        # 从中心出发的贝塞尔式鼠标轨迹（多段小步移动）
+        cx, cy = w // 2, h // 2
+        pyautogui.moveTo(cx, cy, duration=0.3)
+        for dx, dy in ((120, -60), (-90, 40), (60, 80), (-100, -50)):
+            pyautogui.moveRel(dx, dy, duration=0.25)
+        pyautogui.click(cx + 80, cy - 30)  # 页面空白处
+    except Exception:
+        pass
+    # 滚动页面制造 wheel 事件
+    try:
+        sb.execute_script("""
+            (function(){
+                window.scrollBy(0, 150);
+                setTimeout(function(){ window.scrollBy(0, -150); }, 400);
+            })()
+        """)
+    except Exception:
+        pass
 
 
 def dump_driver_log(path="chromedriver.log"):
@@ -624,23 +644,29 @@ def login(sb, email, password) -> bool:
 
     # 等待 Turnstile 渲染（最多 12 秒）。
     # flexible 尺寸下 iframe 可能永不出现，但 HTML 中的 .cf-turnstile 容器
-    # 一定存在；提交一次空表单让浏览器焦点/JS 激活 Turnstile 显式渲染。
+    # 一定存在；容器在而 widget 不渲染通常是 CF 判定自动化嫌疑 ——
+    # 先模拟人类交互（真实鼠标轨迹 + 滚动），再看 token 是否被动注入。
     print("⏳ 等待 Turnstile 验证框出现...")
     ts_found = False
     configured = False
-    for i in range(12):
+    warmed = False
+    for i in range(14):
         state = sb.execute_script(_EXISTS_JS) or ""
         if state:
             ts_found = True
             print(f"✅ 检测到 Turnstile（{state}，{i+1}s）")
             break
-        if i == 5 and not configured:
+        if i == 4 and not configured:
             configured = bool(sb.execute_script(_TURNSTILE_CONFIGURED_JS))
-            if configured:
-                print("  ⚙️ Turnstile 容器存在但 iframe 未渲染；触发一次提交以激活")
+        if i == 6:
+            if configured and not warmed:
+                print("  👤 容器存在但 widget 未渲染；模拟人类交互")
+                _human_warmup(sb)
+                warmed = True
+            elif not configured:
+                # 容器都没有：页面可能仍在 CF challenge 或加载中
                 try:
-                    sb.press_keys('input[name="password"]', '\n')
-                    time.sleep(1)
+                    sb.sleep(1)
                 except Exception:
                     pass
         _nudge_turnstile_launcher(sb)
@@ -650,7 +676,13 @@ def login(sb, email, password) -> bool:
             pass
         time.sleep(1)
 
-    if ts_found:
+    # warmup 后 token 可能已静默注入（invisible 通过）
+    if not ts_found and sb.execute_script(_SOLVED_JS):
+        print("✅ Turnstile 已静默通过（warmup 后 token 注入）")
+        ts_found = True
+        state = "silent"
+
+    if ts_found and state != "silent":
         if not handle_turnstile(sb):
             print("❌ 登录界面的 Turnstile 验证失败")
             sb.save_screenshot("login_turnstile_fail.png")
@@ -667,13 +699,27 @@ def login(sb, email, password) -> bool:
 
     # 提交后若被 error=captcha 打回且 Turnstile 这时才渲染，补一次处理
     time.sleep(2)
-    if "error=" in (sb.get_current_url() or "") and sb.execute_script(_EXISTS_JS):
-        print("↩️ 提交被 captcha 拒绝且 Turnstile 已渲染，重试验证...")
-        if not handle_turnstile(sb):
-            sb.save_screenshot("login_turnstile_fail.png")
-            return False
-        print("🖱️ 重新提交表单...")
-        sb.press_keys('input[name="password"]', '\n')
+    if "error=" in (sb.get_current_url() or ""):
+        err_kind = "captcha" if "captcha" in (sb.get_current_url() or "").lower() else "other"
+        if err_kind == "captcha":
+            if sb.execute_script(_EXISTS_JS):
+                print("↩️ 提交被 captcha 拒绝且 Turnstile 已渲染，重试验证...")
+                if not handle_turnstile(sb):
+                    sb.save_screenshot("login_turnstile_fail.png")
+                    return False
+                print("🖱️ 重新提交表单...")
+                sb.press_keys('input[name="password"]', '\n')
+            elif configured:
+                # widget 仍不渲染：再 warmup 一轮后重试一次
+                print("↩️ captcha 拒绝且 widget 仍未渲染；再次模拟人类交互后重试")
+                _human_warmup(sb)
+                time.sleep(3)
+                if sb.execute_script(_SOLVED_JS):
+                    print("✅ 第二轮 warmup 后 token 注入，重新提交")
+                    sb.press_keys('input[name="password"]', '\n')
+                elif sb.execute_script(_EXISTS_JS):
+                    if handle_turnstile(sb):
+                        sb.press_keys('input[name="password"]', '\n')
 
     print("⏳ 等待登录跳转...")
     for _ in range(12):
