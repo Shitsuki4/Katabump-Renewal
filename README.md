@@ -1,129 +1,134 @@
 # Katabump Renewal
 
-基于 GitHub Actions、SeleniumBase UC 模式和 sing-box 的 Katabump 服务器自动续期工具。支持多账号、订阅自动选节点、按节点纯度排序重试，以及 Telegram 通知。
+GitHub Actions 驱动的 Katabump 多账号续期工具，使用 SeleniumBase 和 sing-box。支持订阅节点排序、逐节点重试、**失败后才启用的认证代理保底**，以及 Telegram 通知。
 
-## 功能
+## 配置
 
-- 多账号批量续期：使用 `USERS_JSON` 配置账号列表。
-- 自动代理选择：`SUB_URL` 支持 Clash YAML、sing-box JSON、Base64 节点链接列表。
-- 节点纯度排序：优先住宅 IP，其次 ISP、未知类型、数据中心 IP；同级按 proxycheck 风险从低到高排序。
-- 自动重试：每个账号按排序池逐个切换节点尝试。
-- Telegram 通知：续期结果、未到续期时间、账号异常和工作流失败均可推送。
-- CI 自检：配置校验和回归测试在续期前运行。
+在 `Settings → Secrets and variables → Actions → Secrets` 添加：
 
-## 部署
+| Secret | 用途 |
+| --- | --- |
+| `USERS_JSON` | 必填账号数组，示例见下方；也支持单账号 `KATABUMP_EMAIL` + `KATABUMP_PASSWORD` |
+| `SUB_URL` | 首选订阅；支持 sing-box JSON、Clash YAML、明文或 Base64 分享链接列表 |
+| `PROXY_URL` | 可选第二线路；支持分享链接、订阅 URL、含认证信息的 HTTP/HTTPS 代理 URL |
+| `FALLBACK_PROXIES` | 可选保底代理列表；只有前面的线路失败才启用 |
+| `TG_BOT_TOKEN` / `TG_CHAT_ID` | 可选 Telegram 通知 |
 
-### 1. Fork 或复制仓库
-
-建议先保持私有仓库运行稳定，确认日志和通知正常后再公开。
-
-### 2. 启用 Actions
-
-进入 `Settings → Actions → General`，选择允许所有 Actions，或至少允许本仓库工作流。
-
-### 3. 配置 Secrets
-
-进入 `Settings → Secrets and variables → Actions → Repository secrets`。
-
-#### 必填：账号
-
-`USERS_JSON` 支持多账号，推荐使用：
+账号格式（`username` 与 `email` 都支持）：
 
 ```json
 [
-  {"username":"a@example.com","password":"password-a"},
-  {"username":"b@example.com","password":"password-b"}
+  {"email": "a@example.com", "password": "password-a"},
+  {"email": "b@example.com", "password": "password-b"}
 ]
 ```
 
-单账号可改用：
+账号配置必须是非空数组，每项都需要邮箱和密码；错误条目不会再被静默丢弃。配置校验失败会返回非零退出码，Actions 会明确显示失败。
 
-- `KATABUMP_EMAIL`
-- `KATABUMP_PASSWORD`
+### 保底代理
 
-#### 推荐：订阅
+将代理列表粘贴到 **`FALLBACK_PROXIES` Secret**，每行一个，不要写入仓库：
 
-- `SUB_URL`：订阅地址。配置后自动抓取、测活、获取出口 IP、排序并生成节点池。
-- `PROXY_URL`：单个节点分享链接；未配置 `SUB_URL` 时作为回退。
-- 两者都不配置则直连，但 GitHub Actions 的数据中心 IP 很难通过 Turnstile。
+```text
+192.0.2.10:8080:username:password
+http://username:password@192.0.2.11:8080
+https://username:password@proxy.example.com:443
+socks5://username:password@192.0.2.12:1080
+```
 
-#### Telegram 通知
+- `host:port:username:password` 默认是 HTTP CONNECT 代理。
+- 也支持 JSON 字符串数组、IPv6 和 URL 编码的用户名/密码；URL 中的 `@`、`:` 等特殊字符请百分号编码。
+- 精确重复项会去重，其他节点按配置顺序尝试，最多配置 50 个。
+- 认证在本机 sing-box 中完成，浏览器只连接 `127.0.0.1:8080`，不依赖 Chrome 的代理认证弹窗。
+- **主线路正常时，不准备、不测活、不使用保底节点。**
 
-1. 与 `@BotFather` 创建 Bot，获取 `TG_BOT_TOKEN`。
-2. 向你的 Bot 发送任意消息，或使用 `@userinfobot` 获取 `TG_CHAT_ID`。
-3. 配置两个 Secrets：
-   - `TG_BOT_TOKEN`
-   - `TG_CHAT_ID`
+### 重试设置
 
-#### 可选
+在 Actions 的 **Variables** 页添加可选参数：
 
-- `NODE_ATTEMPTS`：每个账号的最大节点尝试次数，默认 `3`，建议不超过节点池大小。
+| Variable | 默认值 | 说明 |
+| --- | --- | --- |
+| `NODE_ATTEMPTS` | `3` | 每个主线路来源最多尝试多少个不同节点，范围 1–25；兼容同名 Secret，Secret 优先 |
+| `FALLBACK_ATTEMPTS` | `10` | 保底最多尝试多少个不同节点，范围 1–50；不受主线路重试上限截断 |
+| `RUN_BUDGET_SECONDS` | `2400` | 达到时间预算后不再启动新尝试，范围 1–3000；当前已开始的浏览器操作会完成有界等待 |
+| `UPLOAD_SCREENSHOTS` | 关闭 | 设置为 `true` 才上传诊断截图，保留 1 天；截图可能包含账号信息 |
 
-### 4. 手动验证
+## 执行顺序
 
-进入 `Actions → Katabump Auto Renew → Run workflow`，选择 `main` 分支运行。
+```text
+SUB_URL 订阅节点（有配置时）
+    ↓ 获取失败 / 无可用节点 / 连接或续期重试失败
+PROXY_URL（有配置时）
+    ↓ 仍有失败账号
+FALLBACK_PROXIES（有配置时）
+    ↓ 所有线路失败或耗尽时间预算
+非零退出码 + 失败通知
+```
 
-配置校验、测试、节点选择、代理启动和续期全部通过后，工作流会显示绿色成功。
+没有 `SUB_URL` / `PROXY_URL` 时先直连，直连失败后再用保底。配置了主代理时，不会在失败后擅自降级直连。
 
-## 工作流
+- 已成功续期或被明确确认“尚未到续期时间”的账号，不会在保底阶段重复执行。
+- 每次切换必须经本机控制接口确认，不会偷偷沿用失败节点或回到延迟优先的随机节点。
+- 坏的订阅条目单独隔离，不会让一个不支持的 `flow` / 字段拖垮整个节点池。
+- 代理进程就绪检测不依赖首个出口是否在线；节点不可用时仍能继续切换。
+- 只停止本次运行自己创建的 sing-box，不使用全局 `pkill`。
+- “成功”要求页面明确成功提示或到期日向后推进；错误提示里出现 `renewed` 不会误报成功。
 
-1. 校验账号 JSON、密码和重试次数。
-2. 运行单元测试。
-3. 下载 sing-box。
-4. 抓取订阅并并行测活。
-5. 获取存活节点出口 IP，识别 IP 类型并查询风险分。
-6. 按纯度排序，生成 `config.json` 与 `ranked_pool.json`。
-7. 启动本机 HTTP 代理 `127.0.0.1:8080`。
-8. 使用浏览器完成登录、Turnstile、ALTCHA 和续期。
-9. 失败时按排序切换节点重试，并发送 Telegram 通知。
+## 运行与检查
 
-默认定时：每天 UTC `00:00`，即北京时间 `08:00`。
+进入 `Actions → Katabump Auto Renew → Run workflow`，选择 `main`。
+
+定时任务每 6 小时执行一次：UTC `00:17 / 06:17 / 12:17 / 18:17`，即北京时间 `08:17 / 14:17 / 20:17 / 02:17`。GitHub 定时任务可能延迟；增加检查频率可以降低一次订阅故障就错过续期窗口的风险，但不能保证第三方服务永远可用。
+
+关注 `Run renewal with automatic failover` 步骤：
+
+- `Route source: subscription`：正在使用首选订阅。
+- `Source ... failed ... advancing to next tier`：准备或启动失败，进入下一线路。
+- `Route source: fallback`：已经进入保底代理。
+- 作业摘要展示完成/失败账号数与实际使用的线路层级，不包含密码。
+
+正常续期工作流不会因为代码 push 自动运行；push/PR 会运行独立的 Linux/Windows 回归测试，不读取账号或代理 Secrets。
 
 ## 本地运行
 
-需要 Python 3.12 和 Chrome。
+需要 Python 3.12、Chrome。Linux 无显示环境需要 Xvfb；Windows 直接启动浏览器。
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+# Linux: source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python scripts/install_singbox.py
 seleniumbase install chromedriver
 ```
 
-Linux 无显示环境建议使用 `xvfb-run`：
-
-```bash
-export USERS_JSON='[{"username":"a@example.com","password":"password"}]'
-export SUB_URL='https://example.com/subscription?singbox'
-python auto_proxy.py
-python proxy_runtime.py &
-xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python main.py
-```
-
-只校验配置而不启动浏览器：
+通过环境变量设置账号和所需代理，**不要把真实凭据写进脚本或 Git 历史**。
 
 ```bash
 python main.py --validate-config
+python -m unittest discover -s tests -v
+# Linux:
+xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python main.py
+# Windows:
+python main.py
 ```
 
-## 仓库结构
+`main.py` 现在负责整个代理生命周期，无需另外后台启动 sing-box。高级用法仍支持：
 
-- `main.py`：登录、验证、续期、重试、Telegram 通知和配置校验。
-- `auto_proxy.py`：订阅抓取、协议解析、节点测活、纯度排序和配置生成。
-- `proxy_runtime.py`：sing-box 配置检查、启动和就绪验证。
-- `.github/workflows/renew.yml`：GitHub Actions 工作流。
-- `tests/`：配置校验与节点排序回归测试。
-- `requirements.txt`：Python 依赖。
+```bash
+# 仅准备配置；默认在来源准备失败时自动尝试下一来源
+python auto_proxy.py
+# 只准备某一层，不会执行续期
+python auto_proxy.py --source fallback
+```
 
-## 诊断
+已有外部代理可以通过 `IS_PROXY=true` 和 `PROXY_SERVER` 使用；不要同时让外部进程与本程序占用 `8080` / `9099`。
 
-- 查看 Actions 日志中的 `Auto-select proxy node` 步骤，可看到每个节点是否可达、出口 IP、类型和风险分。
-- 查看 `Run Renew Script` 步骤，可看到当前出口 IP、节点固定和续期结果。
-- 截图上传默认关闭；如需开启，在 `Settings → Secrets and variables → Actions → Variables` 添加 `UPLOAD_SCREENSHOTS=true`。
+## 回归测试与安全
 
-## 安全提示
-
-- 账号、密码、订阅地址、Telegram Token 只能放在 GitHub Secrets。
-- 不要提交 `config.json`、`ranked_pool.json`、日志或截图；`.gitignore` 已忽略这些运行期文件。
-- 公开仓库前建议删除包含订阅、账号或出口 IP 的历史 Actions 记录。
-- 自动化绕过站点验证可能违反目标网站条款，请确认你有合法授权后再使用。
+- 测试包含订阅超时、单个坏节点隔离、主线路成功不触发保底、10 个保底节点不被主重试上限截断、多账号只重试失败者、进程清理及失败退出码。
+- 安装 sing-box 后，测试还会用真实二进制验证 VLESS flow 兼容性，并通过本机模拟 HTTP CONNECT 服务验证代理认证，不使用任何真实账号。
+- sing-box 固定为 `1.13.16`，下载后校验固定 SHA-256；不执行未校验的下载文件。
+- Secrets 只在运行时读取；配置文件设置为仅所有者可读写，忽略 Git 并在 Actions 结束时清理。日志不输出订阅 URL、原始节点名或代理认证信息。
+- GitHub token 只用于仓库维护，**不需要**添加为续期工作的 Secret。曾公开发送的 token、密码应撤销/轮换。
+- 请确认你有权自动化管理对应账号，并遵守目标平台条款。代理可达不代表一定能通过 Cloudflare/Turnstile，也无法恢复已经被平台永久删除的服务器。

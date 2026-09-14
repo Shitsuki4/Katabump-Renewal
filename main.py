@@ -6,12 +6,13 @@ import json
 import re
 import time
 import subprocess
-import urllib.request
 from datetime import datetime, timedelta, timezone
 import argparse
 import requests
-from seleniumbase import SB
-from selenium.common.exceptions import WebDriverException
+
+from fallback_proxy import parse_fallback_proxies
+from renewal_runner import int_setting, run_renewals
+from secrets_runtime import mask_workflow_secrets
 
 # 从环境变量获取账号密码和 TG 配置
 TG_CHAT_ID   = os.environ.get("TG_CHAT_ID") or ""        # tg通知 chat id(可选)
@@ -24,28 +25,34 @@ class RenewalNotEligible(Exception):
     """The server explicitly reports that renewal is not available yet."""
 
 # 多账号来源：USERS_JSON 格式 [{"username":"email","password":"pwd"}, ...]
+class AccountConfigurationError(ValueError):
+    pass
+
+
 def load_accounts():
-    raw = os.environ.get("USERS_JSON", "")
+    raw = os.environ.get("USERS_JSON", "").strip()
     if not raw:
-        # 兼容单账号 env（KATABUMP_EMAIL/KATABUMP_PASSWORD）
-        email = os.environ.get("KATABUMP_EMAIL", "")
-        pwd   = os.environ.get("KATABUMP_PASSWORD", "")
-        if email:
-            return [{"email": email, "password": pwd}]
-        print("❌ 未配置 USERS_JSON 或 KATABUMP_EMAIL/KATABUMP_PASSWORD")
-        return []
+        email = os.environ.get("KATABUMP_EMAIL", "").strip()
+        password = os.environ.get("KATABUMP_PASSWORD", "")
+        return [{"email": email, "password": password}] if email else []
     try:
         users = json.loads(raw)
-        accounts = []
-        for u in users:
-            accounts.append({
-                "email": u.get("username") or u.get("email") or "",
-                "password": u.get("password") or "",
-            })
-        return [a for a in accounts if a["email"]]
-    except Exception as e:
-        print(f"❌ USERS_JSON 解析失败: {e}")
-        return []
+    except ValueError:
+        raise AccountConfigurationError("USERS_JSON 不是有效 JSON") from None
+    if not isinstance(users, list) or not users:
+        raise AccountConfigurationError("USERS_JSON 必须是非空账号数组")
+    accounts = []
+    for index, user in enumerate(users, 1):
+        if not isinstance(user, dict):
+            raise AccountConfigurationError(f"账号 {index} 必须是对象")
+        email = user.get("username") or user.get("email")
+        password = user.get("password", "")
+        if not isinstance(email, str) or not email.strip():
+            raise AccountConfigurationError(f"账号 {index} 缺少有效邮箱")
+        if not isinstance(password, str):
+            raise AccountConfigurationError(f"账号 {index} 的密码必须是字符串")
+        accounts.append({"email": email.strip(), "password": password})
+    return accounts
 
 CURRENT_EMAIL = ""  # 当前正在处理的账号，供 send_tg_message 脱敏
 
@@ -92,9 +99,9 @@ def send_tg_message(status_icon, status_text, time_left=""):
         if r.status_code == 200:
             print("📩 Telegram 通知发送成功！")
         else:
-            print(f"⚠️ Telegram 通知发送失败: {r.text}")
+            print(f"⚠️ Telegram 通知发送失败: HTTP {r.status_code}")
     except Exception as e:
-        print(f"⚠️ Telegram 通知发送异常: {e}")
+        print(f"⚠️ Telegram 通知发送异常: {type(e).__name__}")
 
 #  页面注入脚本
 _EXPAND_JS = """
@@ -385,116 +392,6 @@ def dump_driver_log(path="chromedriver.log"):
     return False
 
 
-def _restart_proxy():
-    """重启 sing-box，让 urltest 重新探测，可能选中池子里另一个节点。
-
-    仅在 GitHub Actions 环境生效（本地无 sing-box 可执行文件则跳过）。
-    就绪检测改为轮询：代理能连上外网就立即返回，不再固定等 26 秒。
-    """
-    if not os.path.exists("sing-box"):
-        print("  （本环境无 sing-box 可执行文件，跳过代理节点切换）")
-        return
-    print("\n🔄 重启 sing-box 以切换代理节点...")
-    subprocess.run(["pkill", "-9", "-f", "sing-box"], capture_output=True)
-    time.sleep(2)
-    log = open("singbox.log", "ab")
-    try:
-        subprocess.Popen(
-            ["./sing-box", "run", "-c", "config.json"],
-            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
-        )
-    finally:
-        log.close()
-    # 轮询等待 urltest 组选出可用节点（最长 40s，通则秒回）
-    import urllib.request
-    for _ in range(20):
-        time.sleep(2)
-        try:
-            ph = urllib.request.ProxyHandler({"http": "http://127.0.0.1:8080",
-                                              "https": "http://127.0.0.1:8080"})
-            urllib.request.build_opener(ph).open(
-                urllib.request.Request("https://api.ip.sb/ip",
-                                       headers={"User-Agent": "curl/8"}),
-                timeout=8).read()
-            print("   代理已恢复")
-            break
-        except Exception:
-            pass
-    else:
-        print("   ⚠️ 40 秒内代理未恢复，继续尝试...")
-    try:
-        with open("singbox.log", "rb") as f:
-            lines = f.read().decode("utf-8", "ignore").splitlines()
-        shown = 0
-        for ln in lines[-40:]:
-            if ("urltest" in ln or "selected" in ln or "node-" in ln) and shown < 5:
-                print("   sing-box:", ln.strip())
-                shown += 1
-    except Exception:
-        pass
-
-def _pin_pool_node(attempt: int) -> None:
-    """Pin the selector "proxy" to the purity-ranked node for this attempt.
-
-    auto_proxy.py ranks unique exit IPs by type (residential > isp > dc) and
-    proxycheck.io risk score into ranked_pool.json. Attempt N uses rank N;
-    beyond the pool we fall back to the latency-based urltest group "auto".
-    This replaces blind urltest re-rolls that kept picking the same
-    Turnstile-blocked exit IP."""
-    if not os.path.exists("ranked_pool.json"):
-        print("   ⚠️ ranked_pool.json 缺失，无法固定节点（沿用 urltest 自动选择）")
-        return
-    try:
-        pool = json.load(open("ranked_pool.json", encoding="utf-8"))
-    except Exception as e:
-        print(f"   ⚠️ 读取 ranked_pool.json 失败: {e}")
-        return
-    if not pool:
-        return
-    i = min(attempt - 1, len(pool) - 1) if attempt <= len(pool) else None
-    if i is None:
-        target, expect = "auto", ""
-        print(f"   第 {attempt} 次尝试超出节点池，回退到 urltest 自动选节点")
-    else:
-        target, expect = pool[i]["tag"], pool[i].get("ip", "")
-        print(f"   📌 固定使用节点 {target}（排名 {i + 1}/{len(pool)}: "
-              f"{pool[i].get('name', '?')[:40]}, {pool[i].get('kind')}, "
-              f"risk={pool[i].get('risk')}）")
-    try:
-        req = urllib.request.Request(
-            "http://127.0.0.1:9099/proxies/proxy",
-            data=json.dumps({"name": target}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="PUT")
-        urllib.request.urlopen(req, timeout=5).read()
-    except Exception as e:
-        print(f"   ⚠️ Clash API 固定节点失败（{e}），沿用当前选择")
-        return
-    # 确认 selector 已指向目标节点；住宅节点的出口 IP 可能按连接轮换，
-    # 所以不能拿探测时的 IP 做严格比对，仅打印当前实际出口做参考。
-    try:
-        cur = json.loads(urllib.request.urlopen(
-            "http://127.0.0.1:9099/proxies/proxy", timeout=5).read().decode())
-        now = (cur.get("now") or "")
-        if now and now != target:
-            print(f"   ⚠️ selector 当前指向 {now}，与预期 {target} 不一致")
-            return
-    except Exception:
-        pass
-    try:
-        ph = urllib.request.ProxyHandler({"http": "http://127.0.0.1:8080",
-                                          "https": "http://127.0.0.1:8080"})
-        ip = urllib.request.build_opener(ph).open(
-            urllib.request.Request("https://api.ip.sb/ip",
-                                   headers={"User-Agent": "curl/8"}),
-            timeout=8).read().decode().strip()
-        if ip and expect and ip != expect:
-            print(f"   实际出口 {ip}（探测时 {expect}，住宅线路出口按连接轮换，属正常）")
-        elif ip == expect:
-            print(f"   出口 IP 确认: {ip}")
-    except Exception:
-        pass
-
 def _switch_to_turnstile_frame(sb):
     """切入页面上的 Turnstile iframe，返回是否成功。"""
     try:
@@ -773,7 +670,7 @@ def _goto_server_detail(sb) -> bool:
 
     # 检查页面顶部是否已有"还无法续期"全局提示
     alert_text = _read_alert(sb)
-    if alert_text and "can't renew" in alert_text.lower():
+    if alert_text and _renew_feedback_outcome(alert_text) == "not_due":
         print(f"ℹ️  页面顶部提示: {alert_text}")
         sb.save_screenshot("renew_not_eligible.png")
         raise RenewalNotEligible(alert_text)
@@ -834,7 +731,7 @@ def _goto_server_detail(sb) -> bool:
 
     # The server edit page renders the eligibility error above the form.
     alert_text = _read_alert(sb)
-    if alert_text and "can't renew" in alert_text.lower():
+    if alert_text and _renew_feedback_outcome(alert_text) == "not_due":
         print(f"ℹ️  页面提示: {alert_text}")
         sb.save_screenshot("renew_not_eligible.png")
         raise RenewalNotEligible(alert_text)
@@ -885,9 +782,7 @@ def _renew_not_due(sb) -> bool:
         """) or ""
 
         low = body.lower()
-        if "can't renew" in low and (
-            "will be able to" in low or "not eligible" in low
-        ):
+        if _renew_feedback_outcome(low) == "not_due":
             return True
 
         # Observed on the free plan: expiry 08-31 opens renewal on 08-30.
@@ -1214,6 +1109,29 @@ def _visible_renew_feedback(sb):
         return ""
 
 
+def _renew_feedback_outcome(feedback):
+    """Negative feedback takes precedence over the substring 'renewed'."""
+    low = feedback.lower()
+    if ("can't renew" in low or "cannot renew" in low) and "will be able to" in low:
+        return "not_due"
+    if any(text in low for text in (
+        "can't renew", "cannot renew", "unable to renew", "not eligible",
+        "already renewed", "not renewed", "not been renewed", "not successfully renewed",
+        "failed", "unsuccessful", "error",
+    )):
+        return "failure"
+    if re.search(r"\b(?:renewed|renewal successful|renew success|extended successfully)\b", low):
+        return "success"
+    return None
+
+
+def _expiry_advanced(before, after):
+    try:
+        return datetime.strptime(after, "%Y-%m-%d") > datetime.strptime(before, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+
+
 def _check_renew_result(sb, expiry_before: str = "") -> bool:
     """Wait for and verify the actual renewal result; return success/failure."""
     print("\n📋 等待并检查真实续期结果...")
@@ -1228,22 +1146,20 @@ def _check_renew_result(sb, expiry_before: str = "") -> bool:
             # The stale server-type warning is not a success result.
             if "server type" in low and "verifying" not in low:
                 _confirm_server_type_warning(sb)
-            if "can't renew" in low and "will be able to" in low:
+            if _renew_feedback_outcome(feedback) == "not_due":
                 sb.save_screenshot("renew_result.png")
                 print("ℹ️ 服务器当前不在可续期窗口内，按无需操作处理")
                 send_tg_message("⏳", "未到续期时间", feedback[:500])
                 return True
-            # Only explicit result text counts as success.
-            if any(kw in low for kw in ("renewed", "renewal successful", "renew success",
-                                        "server renewed", "extended successfully")):
+            outcome = _renew_feedback_outcome(feedback)
+            if outcome == "failure":
+                sb.save_screenshot("renew_result.png")
+                send_tg_message("❌", "未能续期", feedback[:500])
+                return False
+            if outcome == "success":
                 sb.save_screenshot("renew_result.png")
                 send_tg_message("✅", "续期成功", feedback[:500])
                 return True
-            if any(kw in low for kw in ("can't renew", "cannot renew", "unable to renew",
-                                        "not eligible", "already renewed")):
-                sb.save_screenshot("renew_result.png")
-                send_tg_message("⏳", "未能续期", feedback[:500])
-                return False
         time.sleep(2)
 
     sb.save_screenshot("renew_result.png")
@@ -1251,7 +1167,7 @@ def _check_renew_result(sb, expiry_before: str = "") -> bool:
         sb.execute_script("location.reload();")
         time.sleep(6)
         expiry_after = _read_expiry(sb)
-        if expiry_after and expiry_after != expiry_before:
+        if _expiry_advanced(expiry_before, expiry_after):
             print(f"✅ 可见提示缺失，但 Expiry 已由 {expiry_before} 更新为 {expiry_after}")
             send_tg_message("✅", "续期成功", f"Expiry: {expiry_before} -> {expiry_after}")
             return True
@@ -1297,16 +1213,16 @@ def renew_server(sb) -> bool:
 
 def _run_account(sb_kwargs, email, pwd) -> bool:
     """单个账号：启动浏览器 -> 登录 -> 自动续期。返回是否成功。"""
+    from seleniumbase import SB
+    from selenium.common.exceptions import WebDriverException
+
     global CURRENT_EMAIL
     CURRENT_EMAIL = email
     print("🚀 启动浏览器...")
     try:
         with SB(**sb_kwargs) as sb:
-            try:
-                sb.open("https://api.ip.sb/ip")
-                print(f"📍  当前出口IP: {sb.get_text('body')}")
-            except Exception:
-                pass
+            sb.driver.set_page_load_timeout(45)
+            sb.driver.set_script_timeout(30)
 
             if login(sb, email, pwd):
                 try:
@@ -1333,114 +1249,56 @@ def _run_account(sb_kwargs, email, pwd) -> bool:
                         f"{type(e).__name__}: {str(e)[:150]}")
         return False
     except Exception as e:
-        print(f"\n❌ 账号 {email} 处理异常: {e}")
-        send_tg_message("❌", f"处理异常: {e}", "未知")
+        print(f"\n❌ 账号处理异常: {type(e).__name__}")
+        send_tg_message("❌", f"处理异常: {type(e).__name__}", "未知")
         return False
 
 
 #  脚本执行入口 (可选代理)
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Katabump automatic renewal runner")
-    parser.add_argument(
-        "--validate-config",
-        action="store_true",
-        help="validate account and retry configuration without opening a browser",
-    )
-    parser.add_argument(
-        "--notify-failure",
-        action="store_true",
-        help="send a generic workflow-failure Telegram notification",
-    )
-    args = parser.parse_args()
-
+    parser.add_argument("--validate-config", action="store_true")
+    parser.add_argument("--notify-failure", action="store_true")
+    args = parser.parse_args(argv)
     if args.validate_config:
         return validate_config()
     if args.notify_failure:
         return notify_workflow_failure()
-
-    print("#" * 25)
-    print("   katabump 自动登录续期")
-    print("#" * 25)
-
+    if validate_config():
+        return 1
     accounts = load_accounts()
-    if not accounts:
-        print("❌ 没有可用的账号，退出。")
-        raise SystemExit(1)
-
-    IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-    proxy_str = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:8080"
-    sb_kwargs = {"uc": True, "headless": False}
-
-    if IS_PROXY:
-        print(f"🔗 挂载代理: {proxy_str}")
-        sb_kwargs["proxy"] = proxy_str
-    else:
-        print("🌐 未使用代理，直连访问")
-
-    print(f"👥 共 {len(accounts)} 个账号待处理")
-
-    ok_count = 0
-    max_attempts = parse_node_attempts()
-    for idx, acc in enumerate(accounts, 1):
-        email = acc["email"]
-        pwd   = acc["password"]
-        print("\n" + "=" * 25)
-        print(f"  处理账号 {idx}/{len(accounts)}: {email}")
-        print("=" * 25)
-
-        acc_ok = False
-        for attempt in range(1, max_attempts + 1):
-            print(f"  ── 节点尝试 {attempt}/{max_attempts} ──")
-            if attempt > 1:
-                _restart_proxy()   # 换池子里另一个节点再试
-            if IS_PROXY:
-                _pin_pool_node(attempt)  # 按纯度排名固定本次使用的节点
-            if _run_account(sb_kwargs, email, pwd):
-                acc_ok = True
-                break
-        if acc_ok:
-            ok_count += 1
-        else:
-            print(f"❌ 账号 {email} 所有节点尝试均失败")
-            send_tg_message("❌", "节点尝试均失败", f"{max_attempts} 次不同代理节点")
-
-    print("\n" + "#" * 25)
-    print(f"  全部账号处理完毕: {ok_count}/{len(accounts)} 成功")
-    print("#" * 25)
-    if ok_count < len(accounts):
-        raise SystemExit(1)
+    mask_workflow_secrets(accounts)
+    result = run_renewals(accounts, _run_account, node_attempts=parse_node_attempts())
+    if result.failed:
+        global CURRENT_EMAIL
+        CURRENT_EMAIL = ""
+        send_tg_message("❌", "所有可用线路尝试后仍有账号失败",
+                        f"{len(result.failed)}/{result.total} 个账号；请查看 Actions 日志")
+        return 1
+    return 0
 
 
 def parse_node_attempts():
-    raw = os.environ.get("NODE_ATTEMPTS", "3").strip()
-    try:
-        attempts = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"NODE_ATTEMPTS must be an integer, got {raw!r}") from exc
-    if attempts < 1:
-        raise ValueError("NODE_ATTEMPTS must be at least 1")
-    return attempts
+    return int_setting("NODE_ATTEMPTS", 3, 25)
 
 
 def validate_config():
-    accounts = load_accounts()
-    if not accounts:
-        print("❌ 配置校验失败：没有可用账号")
-        return 1
     try:
+        accounts = load_accounts()
         attempts = parse_node_attempts()
+        int_setting("FALLBACK_ATTEMPTS", 10, 50)
+        int_setting("RUN_BUDGET_SECONDS", 2400, 3000)
+        backups = parse_fallback_proxies(os.environ.get("FALLBACK_PROXIES", ""))
     except ValueError as exc:
         print(f"❌ 配置校验失败：{exc}")
         return 1
-    invalid = [
-        account["email"]
-        for account in accounts
-        if not account["password"]
-    ]
-    if invalid:
-        print(f"❌ 配置校验失败：{len(invalid)} 个账号缺少密码")
+    if not accounts:
+        print("❌ 配置校验失败：没有可用账号")
         return 1
-    print(f"✅ 配置校验通过：{len(accounts)} 个账号，最多 {attempts} 次节点尝试")
+    if any(not account["password"] for account in accounts):
+        print("❌ 配置校验失败：账号缺少密码")
+        return 1
+    print(f"✅ 配置校验通过：{len(accounts)} 个账号，主线路最多 {attempts} 次尝试，{len(backups)} 个保底代理")
     return 0
 
 
@@ -1449,4 +1307,4 @@ def notify_workflow_failure():
     return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

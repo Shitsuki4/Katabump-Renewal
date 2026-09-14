@@ -2,8 +2,8 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-    # 每天 UTC 0 点（北京时间 8 点）
-    - cron: "0 0 * * *"
+    # UTC 00:17 / 06:17 / 12:17 / 18:17; avoid the busy top of the hour.
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -16,104 +16,70 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     env:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: utf-8
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: requirements.txt
 
       - name: Install System & Python Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
           seleniumbase install chromedriver
 
-      - name: Validate accounts and retry settings
+      - name: Validate accounts, retry settings and standby syntax
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
           KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
           KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
-          NODE_ATTEMPTS: ${{ secrets.NODE_ATTEMPTS || '3' }}
+          FALLBACK_PROXIES: ${{ secrets.FALLBACK_PROXIES }}
+          NODE_ATTEMPTS: ${{ secrets.NODE_ATTEMPTS || vars.NODE_ATTEMPTS || '3' }}
+          FALLBACK_ATTEMPTS: ${{ vars.FALLBACK_ATTEMPTS || '10' }}
+          RUN_BUDGET_SECONDS: ${{ vars.RUN_BUDGET_SECONDS || '2400' }}
         run: python main.py --validate-config
 
-      - name: Run regression tests
+      - name: Download and verify sing-box
+        env:
+          SUB_URL: ${{ secrets.SUB_URL }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          FALLBACK_PROXIES: ${{ secrets.FALLBACK_PROXIES }}
+        run: |
+          if [ -n "$SUB_URL" ] || [ -n "$PROXY_URL" ] || [ -n "$FALLBACK_PROXIES" ]; then
+            python scripts/install_singbox.py
+          fi
+
+      - name: Run regression and local proxy integration tests
         run: python -m unittest discover -s tests -v
 
-      # ------------------------------------------------------------------
-      # 下载 sing-box（无论是否用代理都需要；auto_proxy.py 也依赖它）
-      # ------------------------------------------------------------------
-      - name: Download sing-box
-        env:
-          SUB_URL: ${{ secrets.SUB_URL }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-        run: |
-          if [ -z "$SUB_URL" ] && [ -z "$PROXY_URL" ]; then
-            exit 0
-          fi
-          SINGBOX_VER="1.13.16"
-          echo "Downloading sing-box v${SINGBOX_VER}..."
-          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
-          tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
-          mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
-          chmod +x ./sing-box
-          ./sing-box version
-
-      # ------------------------------------------------------------------
-      # 自动选节点：有 SUB_URL 时，抓订阅→测活→住宅IP优先→生成 urltest 池 config.json
-      # 没配 SUB_URL 但配了 PROXY_URL 时，解析单节点或订阅地址
-      # 两者都没配则直连
-      # ------------------------------------------------------------------
-      - name: Auto-select proxy node (SUB_URL) or fallback (PROXY_URL)
-        env:
-          SUB_URL: ${{ secrets.SUB_URL }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
-        run: |
-          # 决定 IS_PROXY：SUB_URL 或 PROXY_URL 任一非空即启用代理
-          if [ -n "$SUB_URL" ]; then
-            echo "USING_AUTO=true" >> "$GITHUB_ENV"
-            echo "USING_PROXY=true" >> "$GITHUB_ENV"
-            echo "=== Auto mode: SUB_URL set, auto-selecting node ==="
-            python auto_proxy.py
-          elif [ -n "$PROXY_URL" ]; then
-            echo "USING_PROXY=true" >> "$GITHUB_ENV"
-            echo "=== Fallback mode: PROXY_URL set, generating single-node config ==="
-            python auto_proxy.py --proxy-url
-          else
-            echo "USING_PROXY=false" >> "$GITHUB_ENV"
-            echo "=== Direct mode: no SUB_URL, no PROXY_URL, connecting directly ==="
-          fi
-
-      - name: Start Proxy (sing-box)
-        env:
-          USING_PROXY: ${{ env.USING_PROXY }}
-        run: |
-          if [ "$USING_PROXY" != "true" ]; then
-            echo "Proxy not requested, skipping sing-box startup."
-            exit 0
-          fi
-          python proxy_runtime.py
-
-      - name: Run Renew Script
+      - name: Run renewal with automatic failover
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
           KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
           KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
-          PROXY_SERVER: http://127.0.0.1:8080
-          IS_PROXY: ${{ env.USING_PROXY }}
+          SUB_URL: ${{ secrets.SUB_URL }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          FALLBACK_PROXIES: ${{ secrets.FALLBACK_PROXIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          NODE_ATTEMPTS: ${{ secrets.NODE_ATTEMPTS || '3' }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 main.py
+          NODE_ATTEMPTS: ${{ secrets.NODE_ATTEMPTS || vars.NODE_ATTEMPTS || '3' }}
+          FALLBACK_ATTEMPTS: ${{ vars.FALLBACK_ATTEMPTS || '10' }}
+          RUN_BUDGET_SECONDS: ${{ vars.RUN_BUDGET_SECONDS || '2400' }}
+        run: |
+          umask 077
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python main.py
 
       - name: Notify workflow failure
         if: failure()
@@ -126,9 +92,13 @@ jobs:
         if: ${{ always() && vars.UPLOAD_SCREENSHOTS == 'true' }}
         uses: actions/upload-artifact@v4
         with:
-          name: renew-artifacts
+          name: renew-screenshots
           retention-days: 1
           path: |
             *.png
             screenshots/
           if-no-files-found: ignore
+
+      - name: Remove generated credential files
+        if: always()
+        run: rm -f config.json ranked_pool.json probe_cfg.json ip_probe_cfg.json

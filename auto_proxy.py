@@ -1,52 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-auto_proxy.py — Auto-select working proxy nodes from ANY subscription link.
+"""Prepare a validated primary or standby proxy pool.
 
-Adapts to multiple subscription formats:
-  - sing-box JSON config (starts with '{'): read outbounds directly.
-  - Clash YAML (proxies:): parse with PyYAML.
-  - base64 node-link list (vmess://, vless://, hy2://, ...): decode + parse each.
-
-Fast parallel liveness test (seconds, not minutes):
-  - Build ONE sing-box config with all node outbounds + a urltest group +
-    an external clash_api. Start it once; sing-box probes all nodes in
-    parallel. Read /proxies via the clash API to learn which are alive.
-  - Only for alive nodes: fetch exit IP through each node (temporary HTTP
-    inbound per query) and classify residential/ISP/datacenter via ip-api.com.
-
-Output:
-  config.json — sing-box config with HTTP inbound on 127.0.0.1:8080 and a
-  urltest POOL of the alive, best-scored nodes wrapped in a selector "proxy";
-  main.py pins a specific purity-ranked node per retry via the Clash API.
-  ranked_pool.json — the pool order (tag/name/ip/kind/risk) main.py follows.
-
-  If no low-risk exit survives two probe passes (dirty = proxycheck risk>=66
-  or datacenter), the script exits 3 without writing a pool: Cloudflare
-  refuses to render Turnstile on such exits, so browser renewal is doomed.
-
-Env: SUB_URL (required).
+Subscription formats: sing-box JSON, Clash YAML, plain or base64 share links.
+Bad entries are quarantined; metadata APIs affect ranking, never availability.
+Standby HTTP/SOCKS credentials are read only from FALLBACK_PROXIES at runtime.
 """
 
-import os, sys, json, time, base64, re, subprocess, urllib.request, urllib.error
+import argparse
+import base64
+import http.client
+import json
+import os
+import re
+import time
+import urllib.error
+import urllib.request
+
+from fallback_proxy import parse_fallback_proxies
+from proxy_config import (
+    ProxyConfigurationError, sanitize_outbound, validate_nodes,
+    write_private_json,
+)
+from proxy_runtime import (
+    get_exit_ip, spawn_singbox, stop_process, wait_for_listener,
+)
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote, urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote
 
-LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = 8080
 CLASH_API_PORT = 9099
-TEST_URL = "https://api.ip.sb/ip"
-PROBE_URL = "https://www.gstatic.com/generate_204"
-NODE_TIMEOUT = 8
 ASN_TIMEOUT = 6
 MAX_POOL = 25
-# Cap proxycheck.io free tier usage (100/day no key). We only purity-check
-# this many unique exit IPs; anything beyond is left "unchecked" and ranked
-# by IP type alone.
-PURITY_CHECK_LIMIT = 30
-# proxycheck risk score (0-100) at/above which a node is demoted. 66 is their
-# "high risk" threshold; heavily-abused exits typically score 75+.
-PURITY_RISK_REJECT = 66
+# Up to 80 free-tier queries per day at the default six-hour schedule,
+# leaving room for a manual run. Unchecked exits still participate.
+PURITY_CHECK_LIMIT = 20
 # Exit-kind ranking (lower is better) used to order the pool.
 KIND_SCORE = {"residential": 0, "isp": 1, "unknown": 2, "datacenter": 3}
 # Checked pool order is written here; main.py pins one node per retry attempt
@@ -55,16 +42,6 @@ RANKED_POOL_FILE = "ranked_pool.json"
 
 SKIP_KEYWORDS = ["剩余流量", "距离下次", "套餐到期", "流量剩余", "重置剩余"]
 
-# uTLS fingerprints sing-box 1.13.x actually knows. Subscriptions circulate
-# made-up values like fp=unsafe; a single such node makes `sing-box check`
-# reject the WHOLE probe config (run 31: 495 nodes lost to one bad one).
-KNOWN_UTLS_FINGERPRINTS = {
-    "", "chrome", "firefox", "safari", "ios", "android", "edge", "360",
-    "qq", "random", "randomized", "chrome_psk", "chrome_pske",
-    "chrome_padding_psk", "chrome_padding_pske", "chrome_psk_shuffle",
-    "chrome_pades_padding_psk", "chrome_final_psk", "chrome_final_pske",
-}
-
 # ==========================================================================
 # Format sniffing + parsing
 # ==========================================================================
@@ -72,143 +49,115 @@ KNOWN_UTLS_FINGERPRINTS = {
 def _strip(s):
     return s.strip().lstrip("﻿")
 
-def fetch_subscription(url):
-    """Return a list of node dicts. Auto-detects sing-box json / clash yaml /
-    base64 link list by content sniffing, regardless of query (?clash/?singbox/...).
-    Sends a neutral UA so the server returns its default format; a ?singbox /
-    ?base64 query in the URL takes precedence at the converter.
+class SubscriptionError(RuntimeError):
+    pass
 
-    Retries up to 3 times on transient network errors (timeout, connection
-    reset, 5xx). 15s per attempt is plenty for a healthy subscription host;
-    a 40s hang (the previous default) is almost always a stuck peer we should
-    abort early and retry rather than wait out."""
-    req = urllib.request.Request(url, headers={"User-Agent": "sing-box/1.10"})
-    last_err = None
+
+def fetch_subscription(url):
+    """Retry transient errors, with bounded downloads and credential-safe logs."""
+    if urlparse(url).scheme not in ("http", "https"):
+        raise SubscriptionError("Subscription URLs must use HTTP or HTTPS")
+    req = urllib.request.Request(url, headers={"User-Agent": "sing-box/1.13"})
     for attempt in range(1, 4):
         try:
-            raw = _strip(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
-            if attempt > 1:
-                print(f"  ✓ fetch_subscription succeeded on attempt {attempt}", flush=True)
+            with urllib.request.urlopen(req, timeout=15) as response:
+                data = response.read(8 * 1024 * 1024 + 1)
+            if len(data) > 8 * 1024 * 1024:
+                raise SubscriptionError("Subscription exceeds the 8 MiB limit")
+            raw = _strip(data.decode("utf-8"))
             break
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            last_err = e
-            if attempt < 3:
-                wait = 2 ** attempt  # 2s, 4s
-                print(f"  ⚠ fetch_subscription attempt {attempt}/3 failed: {e!r} — retrying in {wait}s", flush=True)
-                time.sleep(wait)
-            else:
-                print(f"  ✗ fetch_subscription failed after 3 attempts: {e!r}", flush=True)
-    else:
-        raise last_err
-
-    # 1) sing-box JSON config
+        except (urllib.error.URLError, TimeoutError, ConnectionError,
+                http.client.HTTPException) as exc:
+            status = getattr(exc, "code", None)
+            retryable = status is None or status == 429 or status >= 500
+            print(f"Subscription fetch {attempt}/3 failed ({type(exc).__name__}).", flush=True)
+            if attempt == 3 or not retryable:
+                raise SubscriptionError("Subscription fetch failed") from None
+            time.sleep(2 ** attempt)
     if raw.startswith("{"):
         return _from_singbox(raw)
-    # 2) Clash YAML
-    if raw.startswith("mixed-port") or raw.startswith("port:") or "\nproxies:" in raw or raw.startswith("proxies:"):
+    if re.search(r"^proxies\s*:", raw, re.MULTILINE):
         return _from_clash(raw)
-    # 3) base64 link list
     return _from_base64(raw)
 
+
 def _from_singbox(raw):
-    """Extract node outbounds from a sing-box config JSON."""
-    cfg = json.loads(raw)
-    out = []
-    for ob in cfg.get("outbounds", []):
-        t = ob.get("type")
-        if t in ("direct", "block", "dns", "selector", "urltest"):
-            continue
-        if not (ob.get("server") and ob.get("server_port")):
-            continue
-        # Normalize sing-box outbound -> clash-ish dict for to_outbound()
-        # Easier: keep sing-box form directly. We detect by 'type'.
-        ob2 = dict(ob)
-        ob2["name"] = ob.get("tag", "")
-        out.append(("singbox", ob2))
-    return out
+    config = json.loads(raw)
+    nodes = config.get("outbounds", []) if isinstance(config, dict) else []
+    return [("singbox", node) for node in nodes
+            if isinstance(node, dict) and node.get("server") and node.get("server_port")]
+
 
 def _from_clash(raw):
     import yaml
-    cfg = yaml.safe_load(raw)
-    return [("clash", n) for n in cfg.get("proxies", [])
-            if n.get("server") and n.get("port")
-            and n.get("server") not in ("127.0.0.1", "localhost")]
+    config = yaml.safe_load(raw)
+    nodes = config.get("proxies", []) if isinstance(config, dict) else []
+    return [("clash", node) for node in nodes
+            if isinstance(node, dict) and node.get("server") and node.get("port")]
+
 
 def _from_base64(raw):
-    """Decode base64 (possibly multi-chunk) and parse vmess/vless/hy2/trojan/tuic/anytls/ss/socks5 links."""
-    raw = raw.replace(" ", "").replace("\n", "").replace("\r", "")
-    try:
-        decoded = base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "ignore")
-        if "://" in decoded:
-            raw = decoded
-    except Exception:
-        pass
-    out = []
+    # Do not strip newlines from a plaintext list: that concatenated every
+    # share link into one malformed node in the previous implementation.
+    if "://" not in raw:
+        encoded = re.sub(r"\s+", "", raw)
+        try:
+            raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+        except (ValueError, UnicodeError):
+            return []
+    nodes = []
     for line in raw.splitlines():
-        line = line.strip()
-        if "://" not in line:
-            continue
-        node = parse_share_link(line)
+        node = parse_share_link(line.strip())
         if node:
-            out.append(("link", node))
-    return out
-
-
-def _is_share_link(url):
-    return bool(re.match(r"^[a-z0-9+.-]+://", url.strip(), re.IGNORECASE))
+            nodes.append(("link", node))
+    return nodes
 
 
 def _normalize_node_item(item, index):
     source, node = item
-    if source == "singbox":
-        outbound = dict(node)
-        outbound.pop("name", None)
-        tag = node.get("name") or f"node-{index}"
-    else:
-        outbound = to_outbound(node, f"node-{index}")
-        tag = node.get("name") or node.get("tag") or f"node-{index}"
-    return tag, outbound
+    if not isinstance(node, dict):
+        return f"candidate-{index}", None
+    outbound = node if source == "singbox" else to_outbound(node, f"node-{index}")
+    # Subscription-provided display names can themselves contain passwords.
+    return f"candidate-{index}", sanitize_outbound(outbound)
 
 
-def write_single_node_config(nodes):
-    """Write a one-node-per-attempt selector config from a URL or raw link."""
-    if not nodes:
-        raise ValueError("PROXY_URL did not produce any usable nodes")
-    outbounds = []
-    pool = []
-    for index, item in enumerate(nodes, 1):
-        tag, outbound = _normalize_node_item(item, index)
-        if not outbound:
+def normalize_nodes(items):
+    nodes = []
+    for index, item in enumerate(items, 1):
+        try:
+            name = str(item[1].get("name") or item[1].get("tag") or "")
+            if any(word in name for word in SKIP_KEYWORDS):
+                continue
+            name, outbound = _normalize_node_item(item, index)
+            if outbound:
+                nodes.append((name, outbound))
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError):
             continue
-        outbound["tag"] = f"node-{index}"
-        outbounds.append(outbound)
-        pool.append({"tag": outbound["tag"], "name": tag,
-                     "ip": None, "kind": "unknown", "risk": None})
-    if not outbounds:
-        raise ValueError("PROXY_URL did not contain a supported node")
+    print(f"Parsed {len(items)} entries; {len(nodes)} supported candidates.", flush=True)
+    return nodes
 
-    outbounds.append({"type": "urltest", "tag": "auto",
-                      "outbounds": [item["tag"] for item in pool],
-                      "url": PROBE_URL, "interval": "30s"})
-    outbounds.append({"type": "selector", "tag": "proxy",
-                      "outbounds": ["auto"] + [item["tag"] for item in pool],
-                      "default": "auto"})
-    outbounds.append({"type": "direct", "tag": "direct"})
-    config = {
-        "log": {"level": "info", "timestamp": True},
-        "inbounds": [{"type": "http", "tag": "http-in",
-                      "listen": LISTEN_HOST, "listen_port": LISTEN_PORT}],
-        "outbounds": outbounds,
-        "route": {"final": "proxy"},
-        "experimental": {
-            "clash_api": {"external_controller": f"127.0.0.1:{CLASH_API_PORT}"}
-        },
-    }
-    with open("config.json", "w", encoding="utf-8") as config_file:
-        json.dump(config, config_file, ensure_ascii=False, indent=2)
-    with open(RANKED_POOL_FILE, "w", encoding="utf-8") as pool_file:
-        json.dump(pool, pool_file, ensure_ascii=False, indent=1)
-    print(f"✅ config.json written: {len(pool)}-node PROXY_URL fallback pool.")
+
+def write_pool(scored, source):
+    if not scored:
+        raise ProxyConfigurationError("No usable nodes for this source")
+    nodes = validate_nodes([(item[0], item[1]) for item in scored],
+                           path="config.json", probe=False)
+    metadata = {item[0]: item for item in scored}
+    pool = []
+    for index, (name, _) in enumerate(nodes, 1):
+        item = metadata[name]
+        pool.append({"tag": f"node-{index}", "name": f"{source}-{index}",
+                     "ip": item[2], "kind": item[3], "risk": item[5], "source": source})
+    write_private_json(RANKED_POOL_FILE, pool)
+    print(f"Prepared {len(pool)} validated nodes for {source}.", flush=True)
+    return pool
+
+
+def write_single_node_config(items, source="proxy_url"):
+    nodes = normalize_nodes(items)
+    return write_pool([(name, ob, None, "unknown", "", None) for name, ob in nodes], source)
+
 
 # --- share-link parsers (produce clash-ish dicts) ---
 
@@ -231,14 +180,14 @@ def parse_share_link(link):
             return _parse_tuic_link(parsed, params)
         if scheme in ("ss", "shadowsocks"):
             return _parse_ss_link(link, parsed)
-        if scheme in ("socks5", "socks"):
+        if scheme in ("socks5", "socks5h", "socks"):
             return _parse_socks_link(parsed)
     except Exception:
         return None
     return None
 
 def _name(link):
-    return unquote(urlparse(link).fragment) or link[:20]
+    return unquote(urlparse(link).fragment) or "unnamed-node"
 
 def _parse_vmess_link(link):
     enc = link[len("vmess://"):]
@@ -263,8 +212,10 @@ def _parse_vless_link(p, q):
         if q.get("insecure", ["0"])[0] == "1": n["skip-cert-verify"] = True
         if sec == "reality":
             n["reality-opts"] = {"public-key": q.get("pbk", [""])[0], "short-id": q.get("sid", [""])[0]}
-    if n["network"] == "ws":
-        n["ws-opts"] = {"path": unquote(q.get("path", ["/"])[0]), "headers": {"Host": q.get("host", [""])[0]}}
+    if n["network"] in ("ws", "httpupgrade"):
+        n["ws-opts"] = {"path": q.get("path", ["/"])[0], "headers": {"Host": q.get("host", [""])[0]}}
+    if n["network"] == "grpc":
+        n["grpc-opts"] = {"grpc-service-name": q.get("serviceName", [""])[0]}
     return n
 
 def _name_str(p):
@@ -301,24 +252,18 @@ def _parse_tuic_link(p, q):
             "sni": q.get("sni", [""])[0], "skip-cert-verify": q.get("insecure", ["0"])[0] == "1"}
 
 def _parse_ss_link(link, p):
-    # ss://base64(method:password)@host:port#name  OR  ss://method:password@host:port
-    userinfo = p.username or ""
-    if "@" in userinfo or not p.hostname:
-        # legacy: whole thing base64
-        enc = link[len("ss://"):].split("#")[0].split("?")[0]
-        enc += "=" * (-len(enc) % 4)
-        try:
-            dec = base64.b64decode(enc).decode("utf-8")
-            if "@" in dec:
-                mp, hostport = dec.rsplit("@", 1)
-                method, password = mp.split(":", 1)
-                host, port = hostport.rsplit(":", 1)
-                return {"name": _name(link), "type": "ss", "server": host, "port": int(port),
-                        "cipher": method, "password": password}
-        except Exception:
-            pass
-    method = unquote(userinfo.split(":")[0]) if ":" in userinfo else ""
-    password = unquote(userinfo.split(":", 1)[1]) if ":" in userinfo else ""
+    # SIP002: encoded userinfo; legacy: the entire method:password@host:port.
+    body = link.split("://", 1)[1].split("#", 1)[0].split("?", 1)[0]
+    if "@" not in body:
+        decoded = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8")
+        credentials, endpoint = decoded.rsplit("@", 1)
+        p = urlparse("ss://" + endpoint)
+    elif p.password is not None:
+        credentials = unquote(p.username or "") + ":" + unquote(p.password)
+    else:
+        encoded = unquote(p.username or "")
+        credentials = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+    method, password = credentials.split(":", 1)
     return {"name": _name(link), "type": "ss", "server": p.hostname,
             "port": p.port or 8388, "cipher": method, "password": password}
 
@@ -346,73 +291,63 @@ def _tls(n, security):
     return tls
 
 def to_outbound(n, tag):
-    """Accept clash-ish dict OR sing-box outbound dict (marker 'singbox').
-    Clash uses 'port'; sing-box uses 'server_port'. Normalize both."""
-    t = n.get("type")
+    """Convert one Clash/share-link entry, preserving TLS and transports."""
+    kind = n.get("type")
     port = n.get("port") or n.get("server_port")
     if not (n.get("server") and port):
         return None
     base = {"server": n["server"], "server_port": int(port), "tag": tag}
-    if t == "vless":
-        ob = {"type": "vless", **base, "uuid": n["uuid"]}
-        if n.get("flow"): ob["flow"] = n["flow"]
-        sec = "reality" if n.get("reality-opts") else ("tls" if n.get("tls") else "")
-        if sec: ob["tls"] = _tls(n, sec)
-        net = n.get("network", "tcp")
-        if net == "ws":
-            wso = n.get("ws-opts") or {}
-            tr = {"type": "ws"}
-            if wso.get("path"): tr["path"] = wso["path"]
-            h = (wso.get("headers") or {}).get("Host", "")
-            if h: tr["headers"] = {"Host": h}
-            ob["transport"] = tr
-        elif net == "grpc":
-            tr = {"type": "grpc"}
-            sn = (n.get("grpc-opts") or {}).get("grpc-service-name", "")
-            if sn: tr["service_name"] = sn
-            ob["transport"] = tr
+    if kind in ("ss", "shadowsocks"):
+        return {"type": "shadowsocks", **base,
+                "method": n.get("cipher") or n.get("method"), "password": n.get("password", "")}
+    if kind in ("socks", "socks5", "http"):
+        ob = {"type": "http" if kind == "http" else "socks", **base}
+        if kind != "http":
+            ob["version"] = "5"
+        if n.get("username"):
+            ob["username"] = n["username"]
+        if n.get("password"):
+            ob["password"] = n["password"]
+        if kind == "http" and n.get("tls"):
+            ob["tls"] = _tls(n, "tls")
         return ob
-    if t == "hysteria2":
-        ob = {"type": "hysteria2", **base, "password": n.get("password", "")}
-        ob["tls"] = _tls(n, "tls")
+    if kind not in {"vless", "vmess", "trojan", "hysteria2", "tuic", "anytls"}:
+        return None
+    ob = {"type": kind, **base}
+    if kind in {"vless", "vmess", "tuic"}:
+        ob["uuid"] = n.get("uuid", "")
+    if kind in {"trojan", "hysteria2", "tuic", "anytls"}:
+        ob["password"] = n.get("password", "")
+    if kind == "vless" and n.get("flow"):
+        ob["flow"] = n["flow"]
+    if kind == "vmess":
+        ob.update(alter_id=int(n.get("alterId", 0)), security=n.get("cipher", "auto"))
+    security = "reality" if n.get("reality-opts") else "tls"
+    if n.get("tls") or n.get("reality-opts") or kind in {"trojan", "hysteria2", "tuic", "anytls"}:
+        ob["tls"] = _tls(n, security)
+    if kind == "hysteria2":
         obfs = n.get("obfs") or n.get("obfs-param")
-        if obfs: ob["obfs"] = {"type": "salamander", "password": n.get("obfs-password", obfs)}
-        return ob
-    if t == "trojan":
-        ob = {"type": "trojan", **base, "password": n.get("password", "")}
-        if n.get("tls") or n.get("sni"): ob["tls"] = _tls(n, "tls")
-        return ob
-    if t == "anytls":
-        ob = {"type": "anytls", **base, "password": n.get("password", "")}
-        ob["tls"] = _tls(n, "tls")
-        return ob
-    if t == "ss":
-        return {"type": "shadowsocks", **base, "method": n.get("cipher"), "password": n.get("password", "")}
-    if t == "shadowsocks":
-        return {"type": "shadowsocks", **base, "method": n.get("method"), "password": n.get("password", "")}
-    if t == "vmess":
-        ob = {"type": "vmess", **base, "uuid": n.get("uuid", ""),
-              "alter_id": int(n.get("alterId", 0)), "security": n.get("cipher", "auto")}
-        if n.get("tls"): ob["tls"] = _tls(n, "tls")
-        net = n.get("network", "tcp")
-        if net == "ws":
-            wso = n.get("ws-opts") or {}
-            tr = {"type": "ws"}
-            if wso.get("path"): tr["path"] = wso["path"]
-            h = (wso.get("headers") or {}).get("Host", "")
-            if h: tr["headers"] = {"Host": h}
-            ob["transport"] = tr
-        return ob
-    if t == "tuic":
-        ob = {"type": "tuic", **base, "uuid": n.get("uuid", ""), "password": n.get("password", "")}
-        ob["tls"] = _tls(n, "tls")
-        return ob
-    if t in ("socks5", "socks"):
-        ob = {"type": "socks", **base, "version": "5"}
-        if n.get("username"): ob["username"] = n["username"]
-        if n.get("password"): ob["password"] = n["password"]
-        return ob
-    return None
+        if obfs:
+            ob["obfs"] = {"type": "salamander", "password": n.get("obfs-password", obfs)}
+    if kind in {"vless", "vmess", "trojan"}:
+        network = n.get("network", "tcp")
+        if network in ("ws", "httpupgrade"):
+            opts = n.get("ws-opts") or {}
+            transport = {"type": network, "path": opts.get("path", "/")}
+            host = (opts.get("headers") or {}).get("Host")
+            if host:
+                if network == "ws":
+                    transport["headers"] = {"Host": host}
+                else:
+                    transport["host"] = host
+            ob["transport"] = transport
+        elif network == "grpc":
+            opts = n.get("grpc-opts") or {}
+            ob["transport"] = {"type": "grpc", "service_name": opts.get("grpc-service-name", "")}
+        elif network not in ("tcp", ""):
+            # Never silently turn an unsupported transport into plain TCP.
+            return None
+    return ob
 
 # ==========================================================================
 # IP classification
@@ -455,7 +390,7 @@ def purity_risk(ip):
     from the runner directly, not through the node."""
     try:
         req = urllib.request.Request(
-            f"http://proxycheck.io/v2/{ip}?vpn=3&risk=1&seen=1&days=7&tag=renew",
+            f"https://proxycheck.io/v2/{ip}?vpn=3&risk=1&seen=1&days=7&tag=renew",
             headers={"User-Agent": "curl/8"})
         d = json.loads(urllib.request.urlopen(req, timeout=8).read().decode())
         if d.get("status") != "ok":
@@ -486,175 +421,43 @@ def rank_nodes_by_purity(scored):
 # ==========================================================================
 
 def _probe_once(sub_url):
-    """One pass: fetch subscription -> parallel liveness probe -> exit-IP
-    fetch -> classify -> purity check. Returns scored tuples
-    (name, ob, ip, kind, org, risk), or None when nothing probed alive
-    (transient failure the caller may retry)."""
-    print(f"Fetching subscription: {sub_url}")
-    items = fetch_subscription(sub_url)
-    print(f"Parsed {len(items)} candidate nodes.\n")
-
-    # Build (name, outbound) for every node; collect unique tags.
-    nodes = []
-    for src, n in items:
-        name = n.get("name") or n.get("tag", "")
-        if any(k in name for k in SKIP_KEYWORDS):
-            continue
-        if src == "singbox":
-            # n IS already a sing-box outbound dict (has server/server_port/tls/transport).
-            # Strip the tag (will be reassigned) and drop name-only keys.
-            ob = dict(n)
-            ob.pop("name", None)
-            ob.pop("tag", None)
-            # sanity: needs server + server_port
-            if not (ob.get("server") and ob.get("server_port")):
-                continue
-            # CRITICAL: sing-box 1.13.16 nil-panics in TLS handshake when a
-            # tls block lacks `enabled: true` (singbox-format nodes from many
-            # converters only set server_name/utls). Without this fix the whole
-            # sing-box process segfaults and ALL probes report 0 alive.
-            tls = ob.get("tls")
-            if isinstance(tls, dict) and tls.get("enabled") is None:
-                tls["enabled"] = True
-                ob["tls"] = tls
-        else:
-            ob = to_outbound(n, "proxy")
-        if not ob:
-            print(f"  skip: {name[:40]} (type={n.get('type')})")
-            continue
-        # Drop nodes whose transport type is unknown to this sing-box build
-        # (xhttp / httpupgrade etc. need a newer sing-box). One bad outbound
-        # would make sing-box refuse the whole config, killing the probe.
-        tr = (ob.get("transport") or {}).get("type", "")
-        if tr and tr not in ("ws", "grpc", "http", "quic", "h2mux"):
-            continue
-        # Same for unknown uTLS fingerprints (fp=unsafe is circulating).
-        tls = ob.get("tls") or {}
-        utls_fp = ((tls.get("utls") or {}).get("fingerprint") or "")
-        if utls_fp not in KNOWN_UTLS_FINGERPRINTS:
-            print(f"  skip: {name[:40]} (unknown uTLS fingerprint '{utls_fp}')")
-            continue
-        nodes.append((name, ob))
-    print(f"{len(nodes)} nodes to probe in parallel.\n")
-
+    print("Fetching primary subscription (URL redacted).", flush=True)
+    nodes = normalize_nodes(fetch_subscription(sub_url))
     if not nodes:
-        print("❌ No usable nodes."); return None
-
-    # Build ONE config: all outbounds as node-N + urltest + clash_api.
-    outbounds = []
-    tag_map = []  # tag -> name
-    for i, (name, ob) in enumerate(nodes, 1):
-        tag = f"node-{i}"
-        ob = dict(ob); ob["tag"] = tag
-        outbounds.append(ob); tag_map.append((tag, name))
-    outbounds.append({"type": "urltest", "tag": "proxy",
-                      "outbounds": [t for t, _ in tag_map],
-                      "url": PROBE_URL, "interval": "30s"})
-    outbounds.append({"type": "direct", "tag": "direct"})
-
-    probe_cfg = {
-        "log": {"level": "warn", "timestamp": True},
-        "inbounds": [{"type": "http", "tag": "http-in",
-                      "listen": "127.0.0.1", "listen_port": LISTEN_PORT}],
-        "outbounds": outbounds,
-        "route": {"final": "proxy"},
-        "experimental": {"clash_api": {"external_controller": f"127.0.0.1:{CLASH_API_PORT}"}},
-    }
-    open("probe_cfg.json", "w").write(json.dumps(probe_cfg, ensure_ascii=False))
-
-    # Validate config BEFORE running — sing-box check prints the exact error
-    # (e.g. unknown transport / invalid field) that would otherwise kill the
-    # process silently. We validate node-by-node isn't feasible, so check the
-    # whole config; if it fails, progressively strip suspicious outbounds.
-    print("Starting sing-box (parallel probe of all nodes)...")
-    check = subprocess.run(["./sing-box", "check", "-c", "probe_cfg.json"],
-                            capture_output=True, text=True, timeout=15)
-    if check.returncode != 0:
-        print(f"⚠️ sing-box check failed: {check.stderr.strip()[:300]}")
-        # Try to identify the bad outbound by binary-stripping. Simple approach:
-        # re-validate with only the first half, then narrow. For now, log + abort
-        # so we can see the error; a re-run often succeeds with a fresh subscription.
-        # As a fallback, try dropping nodes whose outbound has any non-standard keys.
-        print("Attempting fallback: drop nodes with non-core outbound fields...")
-        CORE = {"type", "tag", "server", "server_port", "uuid", "password",
-                "method", "flow", "tls", "transport", "alter_id", "security",
-                "username", "version", "obfs", "multihop"}
-        cleaned = []
-        for nm, ob in nodes:
-            cob = {k: v for k, v in ob.items() if k in CORE}
-            cleaned.append((nm, cob))
-        outbounds2 = []
-        for i, (nm, ob) in enumerate(cleaned, 1):
-            ob = dict(ob); ob["tag"] = f"node-{i}"; outbounds2.append(ob)
-        outbounds2.append({"type": "urltest", "tag": "proxy",
-                           "outbounds": [f"node-{i}" for i in range(1, len(cleaned)+1)],
-                           "url": PROBE_URL, "interval": "30s"})
-        outbounds2.append({"type": "direct", "tag": "direct"})
-        probe_cfg["outbounds"] = outbounds2
-        open("probe_cfg.json", "w").write(json.dumps(probe_cfg, ensure_ascii=False))
-        tag_map = [(f"node-{i}", nm) for i, (nm, _) in enumerate(cleaned, 1)]
-        check2 = subprocess.run(["./sing-box", "check", "-c", "probe_cfg.json"],
-                                capture_output=True, text=True, timeout=15)
-        print(f"fallback check: rc={check2.returncode} {check2.stderr.strip()[:300]}")
-        if check2.returncode != 0:
-            print("❌ sing-box still rejects config; aborting.")
-            print(check2.stderr.strip()[:500])
-            sys.exit(3)
-
-    p = subprocess.Popen(["./sing-box", "run", "-c", "probe_cfg.json"],
-                         stdout=open("probe_sb.log", "w"), stderr=subprocess.STDOUT)
-    time.sleep(3)
-    if p.poll() is not None:
-        print(f"❌ sing-box exited early (code {p.returncode}). probe_sb.log:")
-        try:
-            print(open("probe_sb.log", encoding="utf-8", errors="ignore").read()[:500])
-        except Exception:
-            pass
-        sys.exit(3)
-    # urltest probes ALL nodes in parallel automatically. Just wait + read once.
+        return None
+    nodes = validate_nodes(nodes, path="probe_cfg.json", probe=True)
+    tag_map = [(f"node-{i}", name) for i, (name, _) in enumerate(nodes, 1)]
+    process = spawn_singbox("probe_cfg.json", "probe_sb.log")
     alive = set()
-    for wait_s in (8, 12, 15):   # ~35s total; urltest probes are parallel
-        time.sleep(wait_s)
-        try:
-            req = urllib.request.Request(f"http://127.0.0.1:{CLASH_API_PORT}/proxies")
-            data = json.loads(urllib.request.urlopen(req, timeout=10).read().decode())
-            for pname, pinfo in data.get("proxies", {}).items():
-                if not pname.startswith("node-"):
-                    continue
-                hist = pinfo.get("history") or []
-                if hist and hist[-1].get("delay", 0) > 0:
-                    alive.add(pname)
-        except Exception:
-            pass
-        if alive:
-            break
-
-    try: p.terminate(); p.wait(timeout=3)
-    except Exception: p.kill()
-
-    print(f"\n=== Parallel probe done: {len(alive)}/{len(tag_map)} alive ===")
-    for tag, name in tag_map:
-        print(f"  {'OK  ' if tag in alive else 'FAIL'} {tag:8s} {name[:40]}")
-
+    try:
+        wait_for_listener(process, CLASH_API_PORT)
+        # Local control requests must not inherit HTTP_PROXY from the host.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for delay in (8, 12, 15):
+            time.sleep(delay)
+            if process.poll() is not None:
+                raise ProxyConfigurationError("Subscription probe process exited")
+            try:
+                with opener.open(f"http://127.0.0.1:{CLASH_API_PORT}/proxies", timeout=5) as response:
+                    data = json.load(response)
+                for tag, info in data.get("proxies", {}).items():
+                    history = info.get("history") or []
+                    if tag.startswith("node-") and history and history[-1].get("delay", 0) > 0:
+                        alive.add(tag)
+            except (OSError, ValueError):
+                continue
+            if alive:
+                break
+    finally:
+        stop_process(process)
+    print(f"Parallel probe: {len(alive)}/{len(nodes)} reachable.", flush=True)
     if not alive:
-        print("\n❌ No reachable node."); return None
-
-    # For alive nodes, fetch exit IP via per-node sing-box. All instances run
-    # in PARALLEL (each on its own port) and IP queries go out concurrently,
-    # so the whole phase costs ~one node startup+probe round (~8s) instead of
-    # ~10-12s per node sequentially.
-    print("\nFetching exit IPs for alive nodes (parallel)...")
-    alive_nodes = []
-    for tag, name in tag_map:
-        if tag not in alive:
-            continue
-        idx = int(tag.split("-")[1]) - 1
-        ob = dict(nodes[idx][1]); ob["tag"] = "proxy"
-        alive_nodes.append((name, ob))
-
+        return None
+    alive_nodes = [nodes[i] for i, (tag, _) in enumerate(tag_map) if tag in alive]
+    print("Fetching exit IPs through one bounded probe process...", flush=True)
     ips_list = _fetch_ips_parallel(alive_nodes)
     # classify_ip does one HTTP call each; run them concurrently too.
-    ips = [ip for ip in ips_list if ip]
+    ips = list(dict.fromkeys(ip for ip in ips_list if ip))
     with ThreadPoolExecutor(max_workers=min(10, max(1, len(ips)))) as ex:
         kinds = list(ex.map(classify_ip, ips))
     kind_by_ip = dict(zip(ips, kinds))
@@ -703,141 +506,98 @@ def _probe_once(sub_url):
     return scored
 
 
-def main():
-    proxy_url = os.environ.get("PROXY_URL", "").strip()
-    if "--proxy-url" in sys.argv[1:] or os.environ.get("TEST_PROXY_URL_MODE") == "1":
-        if not proxy_url:
-            print("PROXY_URL not set, cannot generate fallback config.")
-            sys.exit(2)
-        share_link_protocols = {"vmess", "vless", "hy2", "trojan", "tuic", "anytls", "ss", "socks5"}
-        proxy_scheme = proxy_url.split("://", 1)[0].lower()
-        if proxy_scheme in share_link_protocols:
-            parsed_node = parse_share_link(proxy_url)
-            nodes = [("link", parsed_node)] if parsed_node else []
+def prepare_source(source):
+    """Prepare exactly one tier. The renewal runner decides when to fail over."""
+    if source == "fallback":
+        nodes = parse_fallback_proxies(os.environ.get("FALLBACK_PROXIES", ""))
+        return write_pool([(name, ob, None, "unknown", "", None) for name, ob in nodes], source)
+    if source == "proxy_url":
+        url = os.environ.get("PROXY_URL", "").strip()
+        if not url:
+            raise ProxyConfigurationError("PROXY_URL is empty")
+        parsed = urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.username is not None:
+            nodes = parse_fallback_proxies(url)
+            return write_pool([(name, ob, None, "unknown", "", None) for name, ob in nodes], source)
+        if parsed.scheme in {"http", "https"}:
+            items = fetch_subscription(url)
         else:
-            nodes = fetch_subscription(proxy_url)
-        write_single_node_config(nodes)
-        return
-
-    sub_url = os.environ.get("SUB_URL", "").strip()
-    if not sub_url:
-        print("SUB_URL not set, cannot auto-select proxy.")
-        sys.exit(2)
-
-    # Retry once when no node is reachable yet. Residential/ISP exits often
-    # flap, while a temporary empty probe result does not tell us anything
-    # about node purity.
+            node = parse_share_link(url)
+            items = [("link", node)] if node else []
+        return write_single_node_config(items, source)
+    if source != "subscription":
+        raise ProxyConfigurationError("Unknown proxy source")
+    url = os.environ.get("SUB_URL", "").strip()
+    if not url:
+        raise ProxyConfigurationError("SUB_URL is empty")
     scored = None
-    for attempt in (1, 2):
-        scored = _probe_once(sub_url)
+    for attempt in range(2):
+        scored = _probe_once(url)
         if scored:
             break
-        if attempt == 1:
-            print("\n⚠️ 第 1 轮没有拿到可达节点，5 秒后重试一轮...")
+        if attempt == 0:
+            print("No reachable subscription nodes; retrying once in 5 seconds.", flush=True)
             time.sleep(5)
-
     if not scored:
-        print("\n❌ 两轮探测后仍无可达节点。")
-        sys.exit(3)
-
-    # Always attempt the best available exits in purity order. Prefer
-    # residential and ISP nodes, then low proxycheck risk. If the subscription
-    # has no clean exit, still put its least-bad candidates ahead instead of
-    # aborting before the renewal attempt.
+        raise ProxyConfigurationError("No reachable nodes after two probe passes")
     ranked = rank_nodes_by_purity(scored)
-    clean = [s for s in ranked
-             if s[3] != "datacenter"
-             and (s[5] is None or s[5] < PURITY_RISK_REJECT)]
-    if not clean:
-        print(f"\n⚠️ 未发现低风险非机房出口，将按纯度排序后继续尝试。")
-    pool = ranked[:MAX_POOL]
+    return write_pool(ranked[:MAX_POOL], source)
 
-    outbounds = []
-    for i, (name, ob, ip, kind, org, _risk) in enumerate(pool, 1):
-        ob = dict(ob); ob["tag"] = f"node-{i}"
-        outbounds.append(ob)
-    # "urltest auto" picks lowest latency (fallback), "proxy" selector lets
-    # main.py pin a specific purity-ranked node per retry via the Clash API.
-    outbounds.append({"type": "urltest", "tag": "auto",
-                      "outbounds": [f"node-{i}" for i in range(1, len(pool) + 1)],
-                      "url": PROBE_URL, "interval": "30s"})
-    outbounds.append({"type": "selector", "tag": "proxy",
-                      "outbounds": ["auto"] + [f"node-{i}" for i in range(1, len(pool) + 1)],
-                      "default": "auto"})
-    outbounds.append({"type": "direct", "tag": "direct"})
-
-    config = {
-        "log": {"level": "info", "timestamp": True},
-        "inbounds": [{"type": "http", "tag": "http-in",
-                      "listen": LISTEN_HOST, "listen_port": LISTEN_PORT}],
-        "outbounds": outbounds,
-        "route": {"final": "proxy"},
-        "experimental": {"clash_api": {"external_controller": f"127.0.0.1:{CLASH_API_PORT}"}},
-    }
-    with open("config.json", "w") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
-
-    # Ranked pool metadata for main.py's per-attempt node pinning.
-    with open(RANKED_POOL_FILE, "w") as f:
-        json.dump([{"tag": f"node-{i}", "name": name, "ip": ip,
-                    "kind": kind, "risk": risk}
-                   for i, (name, ob, ip, kind, org, risk) in enumerate(pool, 1)],
-                  f, ensure_ascii=False, indent=1)
-
-    best = pool[0]
-    print(f"\n✅ config.json written: {len(pool)}-node urltest pool.")
-    print(f"   best: {best[0]} (ip={best[2]}, {best[3]})")
-    print(f"   inbound: http://{LISTEN_HOST}:{LISTEN_PORT}")
 
 def _fetch_ips_parallel(nodes):
-    """Start one sing-box per alive node at the same time (each on its own
-    port), query all exit IPs concurrently via threads, then shut everything
-    down. Returns a list of IPs aligned with `nodes` (None on failure).
+    """One sing-box process, dedicated inbound per node, bounded HTTP threads.
 
-    Sequential version cost ~10-12s per node; this costs one startup round
-    plus the slowest single probe, i.e. ~10s for the whole batch."""
+    The old implementation started a process per live node (often hundreds)
+    and leaked child processes/configurations if any operation raised.
+    """
     if not nodes:
         return []
-    procs = []
-    cfg_files = []
-    for i, (_, ob) in enumerate(nodes):
-        port = 18080 + i
-        cfg = {"log": {"level": "warn", "timestamp": True},
-               "inbounds": [{"type": "http", "tag": "in",
-                             "listen": "127.0.0.1", "listen_port": port}],
-               "outbounds": [ob, {"type": "direct", "tag": "direct"}],
-               "route": {"final": "proxy"}}
-        path = f"tc_{i}.json"
-        cfg_files.append(path)
-        open(path, "w").write(json.dumps(cfg, ensure_ascii=False))
-        procs.append(subprocess.Popen(["./sing-box", "run", "-c", path],
-                                      stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.STDOUT))
-    time.sleep(3)  # let all sing-box instances start once, in parallel
+    outbounds, inbounds, rules = [], [], []
+    for index, (_, outbound) in enumerate(nodes):
+        tag = f"exit-{index}"
+        ob = dict(outbound, tag=tag)
+        outbounds.append(ob)
+        inbounds.append({"type": "http", "tag": tag, "listen": "127.0.0.1",
+                         "listen_port": 18080 + index})
+        rules.append({"inbound": [tag], "outbound": tag})
+    config = {"log": {"level": "warn"}, "inbounds": inbounds,
+              "outbounds": outbounds, "route": {"rules": rules, "final": "exit-0"}}
+    write_private_json("ip_probe_cfg.json", config)
+    process = spawn_singbox("ip_probe_cfg.json", "probe_sb.log")
+    try:
+        wait_for_listener(process, 18080)
+        def fetch(index):
+            return get_exit_ip(f"http://127.0.0.1:{18080 + index}")
+        with ThreadPoolExecutor(max_workers=min(12, len(nodes))) as executor:
+            return list(executor.map(fetch, range(len(nodes))))
+    finally:
+        stop_process(process)
 
-    def fetch(i):
-        port = 18080 + i
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--proxy-url", action="store_true")
+    parser.add_argument("--source", choices=("subscription", "proxy_url", "fallback"))
+    args = parser.parse_args(argv)
+    if args.source:
+        sources = [args.source]
+    elif args.proxy_url or os.environ.get("TEST_PROXY_URL_MODE") == "1":
+        sources = ["proxy_url"]
+    else:
+        sources = [source for source, key in (("subscription", "SUB_URL"),
+                    ("proxy_url", "PROXY_URL"), ("fallback", "FALLBACK_PROXIES"))
+                   if os.environ.get(key, "").strip()]
+    if not sources:
+        print("No proxy source configured.", flush=True)
+        return 2
+    for source in sources:
         try:
-            ph = urllib.request.ProxyHandler({
-                "http": f"http://127.0.0.1:{port}",
-                "https": f"http://127.0.0.1:{port}"})
-            op = urllib.request.build_opener(ph)
-            r = op.open(urllib.request.Request(
-                TEST_URL, headers={"User-Agent": "curl/8"}), timeout=NODE_TIMEOUT)
-            return r.read().decode().strip()
-        except Exception:
-            return None
+            prepare_source(source)
+            return 0
+        except Exception as exc:
+            print(f"Proxy source {source} failed ({type(exc).__name__}); trying next source.", flush=True)
+    return 1
 
-    with ThreadPoolExecutor(max_workers=min(16, len(nodes))) as ex:
-        ips = list(ex.map(fetch, range(len(nodes))))
 
-    for p in procs:
-        try: p.terminate(); p.wait(timeout=3)
-        except Exception: p.kill()
-    for path in cfg_files:
-        try: os.remove(path)
-        except OSError: pass
-    return ips
 if __name__ == "__main__":
-    main()
-
+    raise SystemExit(main())

@@ -7,6 +7,7 @@ from unittest import mock
 
 
 import auto_proxy
+import proxy_config
 import main
 
 
@@ -47,8 +48,10 @@ class WorkflowTests(unittest.TestCase):
                                 "method": "2022-blake3-aes-128-gcm",
                                 "password": "test-password",
                             },
-                        )]):
-                    auto_proxy.main()
+                        )]), mock.patch.object(auto_proxy, "validate_nodes", side_effect=lambda nodes, **kw: (
+                            auto_proxy.write_private_json(kw["path"], proxy_config.build_config(nodes, probe=kw["probe"])) or nodes
+                        )):
+                    auto_proxy.main([])
                 config = json.loads(Path("config.json").read_text(encoding="utf-8"))
                 pool = json.loads(Path("ranked_pool.json").read_text(encoding="utf-8"))
             finally:

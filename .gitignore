@@ -22,3 +22,5 @@ latest_logs/
 archived_logs/
 downloaded_files/
 .tools/
+
+ip_probe_cfg.json
