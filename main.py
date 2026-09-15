@@ -246,71 +246,8 @@ return JSON.stringify(out);
 """
 
 # ===== 自动续期相关 =====
-
-# ALTCHA 检测/诊断 JS 用 "return ..." 语句形式（同 Turnstile：部分
-# chromedriver/selenium 组合对 IIFE 表达式一律返回 None）。
-# 在模态框内查找 iframe 并展开，返回点击坐标
-_ALTCHA_EXPAND_JS = """
-var modal = document.querySelector('div.modal.show') || document;
-var iframes = modal.querySelectorAll('iframe');
-for (var i = 0; i < iframes.length; i++) {
-    var r = iframes[i].getBoundingClientRect();
-    if (r.width > 0 && r.height > 0) {
-        iframes[i].style.width  = '300px';
-        iframes[i].style.height = '150px';
-        iframes[i].style.minWidth  = '300px';
-        iframes[i].style.minHeight = '150px';
-        iframes[i].style.visibility = 'visible';
-        iframes[i].style.opacity = '1';
-        var el = iframes[i];
-        for (var j = 0; j < 10; j++) {
-            el = el.parentElement;
-            if (!el) break;
-            el.style.overflow = 'visible';
-        }
-        var r2 = iframes[i].getBoundingClientRect();
-        return { cx: Math.round(r2.x + 30), cy: Math.round(r2.y + r2.height / 2) };
-    }
-}
-return null;
-"""
-
-# 检测 ALTCHA 是否已验证通过
-_ALTCHA_SOLVED_JS = r"""
-var modal = document.querySelector('div.modal.show') || document;
-var inputs = modal.querySelectorAll('input[type="hidden"]');
-for (var i = 0; i < inputs.length; i++) {
-    var n = (inputs[i].name || '').toLowerCase();
-    if ((n.includes('altcha') || n.includes('captcha')) &&
-        inputs[i].value && inputs[i].value.length > 20) return {ok:true, why:'hidden-input'};
-}
-var w = modal.querySelector('[data-state="verified"],.altcha--verified,.altcha-verified');
-if (w) return {ok:true, why:'data-state'};
-var state = modal.querySelector('altcha-widget [data-state], .altcha[data-state], [data-state]');
-return {ok:false, why:(state && state.getAttribute('data-state')) || ''};
-"""
-
-# 输出模态框内 ALTCHA 相关的 DOM 诊断信息
-_ALTCHA_DIAG_JS = r"""
-var modal = document.querySelector('div.modal.show') || document;
-var out = {hidden:[], buttons:[], state:null, widget:null, forms:0};
-modal.querySelectorAll('input[type="hidden"]').forEach(function(i){
-    var n = (i.name || '').toLowerCase();
-    if (n.indexOf('altcha') > -1 || n.indexOf('captcha') > -1)
-        out.hidden.push({name:i.name || i.id || '?', len:(i.value || '').length});
-});
-modal.querySelectorAll('button').forEach(function(b){
-    out.buttons.push({t:(b.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
-                      dis:!!b.disabled, type:(b.type || '')});
-});
-var w = modal.querySelector('altcha-widget, [data-state], .altcha');
-if (w) {
-    out.state = w.getAttribute('data-state');
-    out.widget = (w.outerHTML || '').replace(/\s+/g, ' ').slice(0, 500);
-}
-out.forms = modal.querySelectorAll('form').length;
-return out;
-"""
+# ALTCHA 为 PoW 验证(auto=onsubmit),点击 Renew 提交后由页面自动完成,
+# 无需主动点击求解 —— 沿用 wszpwu1 参考仓库的被动等待方案。
 
 
 #  底层输入工具
@@ -836,155 +773,6 @@ def _open_renew_modal(sb) -> bool:
         return False
 
 
-def _renew_not_due(sb) -> bool:
-    """The site exposes the renewal window even when its modal can be opened."""
-    try:
-        body = sb.execute_script(r"""
-            return document.body.innerText || '';
-        """) or ""
-
-        low = body.lower()
-        if _renew_feedback_outcome(low) == "not_due":
-            return True
-
-        # Observed on the free plan: expiry 08-31 opens renewal on 08-30.
-        match = re.search(
-            r"Expiry\s*(?:\n\s*|:\s*)(\d{4}-\d{2}-\d{2})", body
-        )
-        if match:
-            expiry = datetime.strptime(match.group(1), "%Y-%m-%d").date()
-            opens_on = expiry - timedelta(days=1)
-            today = datetime.now(timezone.utc).date()
-            if today < opens_on:
-                print(
-                    f"ℹ️ 按 Expiry 预判续期窗口: {opens_on.isoformat()} "
-                    f"(today UTC: {today.isoformat()})"
-                )
-                return True
-    except Exception:
-        return False
-
-    return False
-
-
-def _altcha_wait_strong_signal(sb, timeout_s: int = 20) -> bool:
-    """等待 PoW 结果写入隐藏 input 或 ALTCHA 进入 verified 状态。"""
-    for _ in range(timeout_s):
-        time.sleep(1)
-        strong = sb.execute_script(_ALTCHA_SOLVED_JS) or {}
-        if strong.get("ok") and strong.get("why") == "hidden-input":
-            print("  ✅ 隐藏 input 已写入 PoW 结果")
-            return True
-    return False
-
-
-def _altcha_dump_diag(sb):
-    try:
-        print("  🔍", sb.execute_script(_ALTCHA_DIAG_JS))
-    except Exception:
-        pass
-
-
-def _solve_altcha(sb) -> bool:
-    """Solve ALTCHA and require a real token or verified state."""
-    print("\n🔐 处理 ALTCHA 人机验证...")
-    time.sleep(2)
-
-    # 先检查是否已自动通过
-    solved = sb.execute_script(_ALTCHA_SOLVED_JS) or {}
-    if solved.get("ok"):
-        print(f"✅ ALTCHA 已自动通过（信号: {solved.get('why')}）")
-        return True
-
-    # 展开模态框内 iframe 并获取坐标
-    coords = None
-    try:
-        coords = sb.execute_script(_ALTCHA_EXPAND_JS)
-    except Exception:
-        pass
-
-    if coords:
-        print(f"  📍 找到模态框内 iframe 坐标: ({coords['cx']}, {coords['cy']})")
-
-    # 最多尝试 3 轮
-    for attempt in range(3):
-        solved = sb.execute_script(_ALTCHA_SOLVED_JS) or {}
-        if solved.get("ok"):
-            print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮，信号: {solved.get('why')}）")
-            return True
-
-        # 策略 1: xdotool 物理点击 iframe 坐标
-        if coords:
-            try:
-                wi = sb.execute_script(_WININFO_JS)
-            except Exception:
-                wi = {"sx": 0, "sy": 0, "oh": 800, "ih": 768}
-            bar = wi["oh"] - wi["ih"]
-            ax  = coords["cx"] + wi["sx"]
-            ay  = coords["cy"] + wi["sy"] + bar
-            print(f"🖱️  ALTCHA点击复选框  ({ax}, {ay})")
-            _xdotool_click(ax, ay)
-
-        # 策略 2: SeleniumBase 原生点击模态框内 iframe 元素
-        try:
-            iframes = sb.find_elements('div.modal.show iframe')
-            for iframe in iframes:
-                try:
-                    iframe.click()
-                    print("🖱️  SeleniumBase 点击模态框 iframe")
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # 策略 3: JS 遍历模态框内所有可点击元素
-        sb.execute_script("""
-            var modal = document.querySelector('div.modal.show');
-            if (!modal) return;
-            // 点击 iframe
-            var iframes = modal.querySelectorAll('iframe');
-            for (var i = 0; i < iframes.length; i++) {
-                iframes[i].click();
-                iframes[i].dispatchEvent(new MouseEvent('click', {bubbles:true}));
-            }
-            // 点击含 checkbox 的 label
-            var labels = modal.querySelectorAll('label');
-            for (var j = 0; j < labels.length; j++) {
-                var txt = (labels[j].textContent || '').toLowerCase();
-                if (txt.includes('robot') || txt.includes('captcha') || txt.includes('verify'))
-                    labels[j].click();
-            }
-            // 点击 checkbox
-            var cbs = modal.querySelectorAll('input[type="checkbox"]');
-            for (var k = 0; k < cbs.length; k++) {
-                if (!cbs[k].disabled) {
-                    cbs[k].click();
-                    cbs[k].dispatchEvent(new MouseEvent('click', {bubbles:true}));
-                }
-            }
-        """)
-
-        # 等待验证结果
-        for _ in range(6):
-            time.sleep(1)
-            solved = sb.execute_script(_ALTCHA_SOLVED_JS) or {}
-            if solved.get("ok"):
-                print(f"✅ ALTCHA 验证通过（第 {attempt + 1} 轮，信号: {solved.get('why')}）")
-                return True
-
-        print(f"  ⚠️ 第 {attempt + 1} 轮未通过，重试...")
-        # 重新获取坐标（iframe 可能已重新渲染）
-        try:
-            new_coords = sb.execute_script(_ALTCHA_EXPAND_JS)
-            if new_coords:
-                coords = new_coords
-        except Exception:
-            pass
-
-    print("  ❌ ALTCHA 3 轮均失败")
-    return False
-
-
 def _read_expiry(sb) -> str:
     """Read the current server expiry, used as a submit-independent result check."""
     try:
@@ -996,137 +784,6 @@ def _read_expiry(sb) -> str:
         """) or ""
     except Exception:
         return ""
-
-
-def _submit_renew(sb) -> bool:
-    """Submit the renewal form without causing ALTCHA to restart.
-
-    With auto=onsubmit, form.requestSubmit() emits another submit event. If a
-    token already exists, that second event makes ALTCHA reset and verify again
-    instead of reaching the server with the current token. HTMLFormElement's
-    submit() deliberately bypasses submit handlers and preserves that token.
-    """
-    print("🖱️  提交模态框中的 Renew 表单...")
-    time.sleep(2)
-    _altcha_dump_diag(sb)
-
-    action = ""
-    try:
-        state = sb.execute_script(r"""
-            var m = document.querySelector('div.modal.show');
-            if (!m) return {modal:false};
-            var f = m.querySelector('form');
-            var token = m.querySelector(
-                'input[type="hidden"][name="altcha"], input[name="altcha"]'
-            );
-            var button = m.querySelector('button[type="submit"]') ||
-                         m.querySelector('button.btn-primary');
-            return {
-                modal:true,
-                form:!!f,
-                token:!!(token && token.value),
-                button:!!button,
-                enabled:!!(button && !button.disabled),
-                text:((button && button.textContent) || '').trim()
-            };
-        """) or {}
-
-        if state.get("modal") and state.get("form") and state.get("token"):
-            sb.execute_script("""
-                var m = document.querySelector('div.modal.show');
-                var f = m && m.querySelector('form');
-                if (f) f.submit();
-            """)
-            action = "submitted-token"
-        elif state.get("modal") and state.get("button") and state.get("enabled"):
-            sb.execute_script("""
-                var m = document.querySelector('div.modal.show');
-                var b = m.querySelector('button[type="submit"]') ||
-                        m.querySelector('button.btn-primary');
-                if (b) b.click();
-            """)
-            action = "clicked-submit"
-            # Let the ALTCHA auto=onsubmit handler verify and resubmit itself.
-            for _ in range(20):
-                time.sleep(1)
-                now = sb.execute_script(r"""
-                    var m = document.querySelector('div.modal.show');
-                    if (!m) return {modal:false};
-                    var f = m.querySelector('form');
-                    var token = m.querySelector('input[name="altcha"]');
-                    return {modal:true, form:!!f, token:!!(token && token.value)};
-                """) or {}
-                if not now.get("modal"):
-                    break
-                if now.get("form") and now.get("token"):
-                    sb.execute_script("""
-                        var m = document.querySelector('div.modal.show');
-                        var f = m && m.querySelector('form');
-                        if (f) f.submit();
-                    """)
-                    action = "submitted-after-altcha"
-                    break
-        else:
-            print(f"  ⚠️ 表单状态异常: {state}")
-            sb.save_screenshot("renew_submit_state.png")
-            return False
-    except Exception as e:
-        print(f"  ❌ 提交异常: {e}")
-        sb.save_screenshot("renew_submit_error.png")
-        return False
-
-    if action:
-        print(f"  ✅ Renew 提交动作完成（{action}）")
-        time.sleep(3)
-        _altcha_dump_diag(sb)
-        return True
-
-    # Failure: report honestly, don't fake success.
-    sb.save_screenshot("renew_submit_timeout.png")
-    print("  ❌ Renew 表单未能提交")
-    return False
-
-
-def _confirm_server_type_warning(sb) -> bool:
-    """Handle only a visible confirmation dialog, never a background alert.
-
-    The page may retain an old Bootstrap alert from the server edit page. It
-    must not be used as evidence that a confirmation dialog is open.
-    """
-    try:
-        state = sb.execute_script("""
-            var m = document.querySelector('div.modal.show, div[role="dialog"]');
-            if (!m) return {visible:false, text:''};
-            var r = m.getBoundingClientRect();
-            return {visible:r.width > 0 && r.height > 0, text:(m.innerText||'').trim()};
-        """)
-    except Exception:
-        return False
-    text = (state or {}).get("text", "")
-    if not (state or {}).get("visible") or "server type" not in text.lower():
-        return False
-
-    print("⚠️ 检测到可见的 server type 确认框...")
-    sb.save_screenshot("renew_warn_before_confirm.png")
-    clicked = sb.execute_script("""
-        var m = document.querySelector('div.modal.show, div[role="dialog"]');
-        if (!m) return false;
-        var re = /confirm|continue|yes|ok|确定|确认|继续|更换/;
-        for (var b of m.querySelectorAll('button')) {
-            var t = (b.textContent||'').trim().toLowerCase();
-            if (!b.disabled && re.test(t) && !/^renew$/.test(t)) {
-                b.click(); return true;
-            }
-        }
-        return false;
-    """)
-    if clicked:
-        print("  ✅ 已点击 server type 确认按钮")
-        time.sleep(3)
-        sb.save_screenshot("renew_warn_after_confirm.png")
-        return True
-    print("  ❌ 未找到明确的 server type 确认按钮")
-    return False
 
 
 def _visible_renew_feedback(sb):
@@ -1183,11 +840,7 @@ def _check_renew_result(sb, expiry_before: str = "") -> bool:
         feedback = _visible_renew_feedback(sb)
         if feedback:
             last_feedback = feedback
-            low = feedback.lower()
             print(f"  页面状态: {feedback[:180]}")
-            # The stale server-type warning is not a success result.
-            if "server type" in low and "verifying" not in low:
-                _confirm_server_type_warning(sb)
             if _renew_feedback_outcome(feedback) == "not_due":
                 sb.save_screenshot("renew_result.png")
                 print("ℹ️ 服务器当前不在可续期窗口内，按无需操作处理")
@@ -1222,8 +875,58 @@ def _check_renew_result(sb, expiry_before: str = "") -> bool:
     return False
 
 
+def _submit_first_renew(sb):
+    """点击模态框内第一次 Renew 按钮（ALTCHA auto=onsubmit 会随后自动验证）。"""
+    print("🖱️  点击第一次 Renew 按钮...")
+    try:
+        submit = sb.find_element('div.modal.show button.btn-primary', timeout=5)
+        submit.click()
+    except Exception:
+        sb.execute_script("""
+            var m = document.querySelector('div.modal.show');
+            if (!m) return;
+            var bs = m.querySelectorAll('button');
+            for (var i = 0; i < bs.length; i++)
+                if (/renew/i.test(bs[i].textContent)) { bs[i].click(); break; }
+        """)
+    time.sleep(3)
+
+
+def _confirm_second_renew(sb):
+    """处理二次确认弹窗：点第二次 Renew，然后等待被动 ALTCHA 自动完成。"""
+    print("\n🔄 检查是否有二次确认弹窗...")
+    alert_text = _read_alert(sb)
+    if alert_text and ("changing the server type" in alert_text.lower()
+                       or "startup command" in alert_text.lower()):
+        print("⚠️ 检测到确认弹窗，点击第二次 Renew...")
+        clicked = False
+        try:
+            confirm_btn = sb.find_element('div.modal.show button.btn-primary', timeout=5)
+            confirm_btn.click()
+            clicked = True
+            print("✅ 第二次点击 btn-primary")
+        except Exception:
+            pass
+        if not clicked:
+            sb.execute_script("""
+                var m = document.querySelector('div.modal.show') || document.body;
+                var bs = m.querySelectorAll('button');
+                for (var i = 0; i < bs.length; i++) {
+                    var t = (bs[i].textContent || '').toLowerCase();
+                    if (t.includes('renew') || t.includes('confirm') ||
+                        t.includes('ok') || t.includes('continue'))
+                        { bs[i].click(); break; }
+                }
+            """)
+            print("✅ JS 第二次点击确认按钮")
+    else:
+        print("ℹ️ 无二次确认弹窗，继续等待...")
+    print("⏳ 等待 30 秒（被动 ALTCHA 自动验证中）...")
+    time.sleep(30)
+
+
 def renew_server(sb) -> bool:
-    """登录成功后调用：自动进入详情页 -> Renew -> ALTCHA -> 提交。"""
+    """登录成功后调用：进入详情页 -> 打开 Renew 模态框 -> 被动 ALTCHA 流程。"""
     print("\n" + "#" * 25)
     print("  开始自动续期流程")
     print("#" * 25)
@@ -1233,7 +936,7 @@ def renew_server(sb) -> bool:
 
     if _renew_not_due(sb):
         sb.save_screenshot("renew_not_due.png")
-        print("ℹ️ 服务器尚未进入可续期窗口，跳过 ALTCHA 和提交")
+        print("ℹ️ 服务器尚未进入可续期窗口，跳过 Renew 提交")
         send_tg_message("⏳", "未到续期时间", "服务器当前不在可续期窗口内")
         return True
 
@@ -1242,14 +945,8 @@ def renew_server(sb) -> bool:
 
     expiry_before = _read_expiry(sb)
 
-    altcha_ok = _solve_altcha(sb)
-    if not altcha_ok:
-        print("⚠️ ALTCHA 验证未通过，终止本次续期，不伪报成功")
-        return False
-
-    if not _submit_renew(sb):
-        return False
-    _confirm_server_type_warning(sb)
+    _submit_first_renew(sb)
+    _confirm_second_renew(sb)
     return _check_renew_result(sb, expiry_before)
 
 
