@@ -145,39 +145,36 @@ _SOLVED_JS = ("var i=document.querySelector('input[name=\"cf-turnstile-response\
               "return !!(i && i.value && i.value.length > 20);")
 
 _WININFO_JS = """
-(function(){
-    return {
-        sx: window.screenX || 0,
-        sy: window.screenY || 0,
-        oh: window.outerHeight,
-        ih: window.innerHeight
-    };
-})()
+return {
+    sx: window.screenX || 0,
+    sy: window.screenY || 0,
+    oh: window.outerHeight,
+    ih: window.innerHeight
+};
 """
 
 # Turnstile 复选框 iframe 的可见包围盒（用于 xdotool 物理点击）
 _TURNSTILE_BBOX_JS = """
-(function(){
-    function expand(f){
-        f.style.width='300px'; f.style.height='80px';
-        f.style.minWidth='300px'; f.style.minHeight='80px';
-        f.style.visibility='visible'; f.style.opacity='1';
-        f.style.zIndex='9999';
-        var p=f.parentElement, guard=0;
-        while(p && guard<14){ p.style.overflow='visible'; p=p.parentElement; guard++; }
+function expand(f){
+    f.style.width='300px'; f.style.height='80px';
+    f.style.minWidth='300px'; f.style.minHeight='80px';
+    f.style.visibility='visible'; f.style.opacity='1';
+    f.style.zIndex='9999';
+    var p=f.parentElement, guard=0;
+    while(p && guard<14){ p.style.overflow='visible'; p=p.parentElement; guard++; }
+    var r=f.getBoundingClientRect();
+    return { x: Math.round(r.left), y: Math.round(r.top),
+             w: Math.round(r.width), h: Math.round(r.height) };
+}
+if (!window.frames) return null;
+var frames = document.querySelectorAll('iframe');
+for (var i=0;i<frames.length;i++){
+    var f=frames[i]; var src=f.src||'';
+    if (src.indexOf('challenges.cloudflare.com')>-1 || src.indexOf('/turnstile/')>-1){
         var r=f.getBoundingClientRect();
-        return { x: Math.round(r.left), y: Math.round(r.top),
-                 w: Math.round(r.width), h: Math.round(r.height) };
+        if (r.width>0 && r.height>0) return expand(f);
     }
-    if (!window.frames) return null;
-    var frames = document.querySelectorAll('iframe');
-    for (var i=0;i<frames.length;i++){
-        var f=frames[i]; var src=f.src||'';
-        if (src.indexOf('challenges.cloudflare.com')>-1 || src.indexOf('/turnstile/')>-1){
-            var r=f.getBoundingClientRect();
-            if (r.width>0 && r.height>0) return expand(f);
-        }
-    }
+}
     // 兜底：Turnstile 组件容器内部的 iframe
     var q = document.querySelector(
         '[class*="cf-turnstile"] iframe, [id*="turnstile"] iframe, '+
@@ -185,144 +182,134 @@ _TURNSTILE_BBOX_JS = """
     );
     if (q) return expand(q);
     return null;
-})()
 """
 
 # 在 Turnstile 尚未加载时，尝试点击“启动验证”的入口控件
 _TURNSTILE_LAUNCH_CLICK_JS = """
-(function(){
-    if (document.querySelector('input[name="cf-turnstile-response"]')) return 'turnstile-ready';
-    function isVisible(el){
-        if (!el) return false;
-        var r = el.getBoundingClientRect();
-        var s = window.getComputedStyle(el);
-        return r.width > 8 && r.height > 8 && s.display !== 'none' &&
-               s.visibility !== 'hidden' && s.opacity !== '0';
-    }
-    function fireClick(el){
-        if (!isVisible(el)) return false;
-        var r = el.getBoundingClientRect();
-        var cx = r.left + Math.min(30, Math.max(10, r.width / 2));
-        var cy = r.top + r.height / 2;
-        ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(tp){
-            el.dispatchEvent(new MouseEvent(tp, {
-                bubbles: true, cancelable: true, composed: true,
-                clientX: cx, clientY: cy, button: 0
-            }));
-        });
-        try { el.click(); } catch(e) {}
-        return true;
-    }
+if (document.querySelector('input[name="cf-turnstile-response"]')) return 'turnstile-ready';
+function isVisible(el){
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    var s = window.getComputedStyle(el);
+    return r.width > 8 && r.height > 8 && s.display !== 'none' &&
+           s.visibility !== 'hidden' && s.opacity !== '0';
+}
+function fireClick(el){
+    if (!isVisible(el)) return false;
+    var r = el.getBoundingClientRect();
+    var cx = r.left + Math.min(30, Math.max(10, r.width / 2));
+    var cy = r.top + r.height / 2;
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(tp){
+        el.dispatchEvent(new MouseEvent(tp, {
+            bubbles: true, cancelable: true, composed: true,
+            clientX: cx, clientY: cy, button: 0
+        }));
+    });
+    try { el.click(); } catch(e) {}
+    return true;
+}
 
-    var f = document.querySelector(
-        'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
-    );
-    if (f && fireClick(f)) return 'clicked-iframe';
+var f = document.querySelector(
+    'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+);
+if (f && fireClick(f)) return 'clicked-iframe';
 
-    var launchers = document.querySelectorAll(
-        '[class*="cf-turnstile"], [id*="turnstile"], [class*="turnstile"], ' +
-        'label[for*="turnstile"], div[role="button"], button'
-    );
-    for (var i = 0; i < launchers.length; i++){
-        var e = launchers[i];
-        if (!isVisible(e)) continue;
-        var hint = ((e.className || '') + ' ' + (e.id || '') + ' ' +
-                    (e.getAttribute('aria-label') || '') + ' ' +
-                    (e.textContent || '')).toLowerCase();
-        if (hint.indexOf('turnstile') > -1 || hint.indexOf('verify') > -1 ||
-            hint.indexOf('captcha') > -1 || hint.indexOf('robot') > -1){
-            if (fireClick(e)) return 'clicked-launcher';
-        }
+var launchers = document.querySelectorAll(
+    '[class*="cf-turnstile"], [id*="turnstile"], [class*="turnstile"], ' +
+    'label[for*="turnstile"], div[role="button"], button'
+);
+for (var i = 0; i < launchers.length; i++){
+    var e = launchers[i];
+    if (!isVisible(e)) continue;
+    var hint = ((e.className || '') + ' ' + (e.id || '') + ' ' +
+                (e.getAttribute('aria-label') || '') + ' ' +
+                (e.textContent || '')).toLowerCase();
+    if (hint.indexOf('turnstile') > -1 || hint.indexOf('verify') > -1 ||
+        hint.indexOf('captcha') > -1 || hint.indexOf('robot') > -1){
+        if (fireClick(e)) return 'clicked-launcher';
     }
-    return 'no-launcher';
-})()
+}
+return 'no-launcher';
 """
 
 # 页面所有 iframe 的 src + 矩形（诊断用）
 _IFRAME_MAP_JS = """
-(function(){
-    var out=[];
-    var frames=document.querySelectorAll('iframe');
-    for (var i=0;i<frames.length;i++){
-        var f=frames[i], r=f.getBoundingClientRect();
-        out.push({ src:(f.src||'').slice(0,80),
-                   x:Math.round(r.left), y:Math.round(r.top),
-                   w:Math.round(r.width), h:Math.round(r.height) });
-    }
-    return JSON.stringify(out);
-})()
+var out=[];
+var frames=document.querySelectorAll('iframe');
+for (var i=0;i<frames.length;i++){
+    var f=frames[i], r=f.getBoundingClientRect();
+    out.push({ src:(f.src||'').slice(0,80),
+               x:Math.round(r.left), y:Math.round(r.top),
+               w:Math.round(r.width), h:Math.round(r.height) });
+}
+return JSON.stringify(out);
 """
 
 # ===== 自动续期相关 =====
 
+# ALTCHA 检测/诊断 JS 用 "return ..." 语句形式（同 Turnstile：部分
+# chromedriver/selenium 组合对 IIFE 表达式一律返回 None）。
 # 在模态框内查找 iframe 并展开，返回点击坐标
 _ALTCHA_EXPAND_JS = """
-(function() {
-    var modal = document.querySelector('div.modal.show') || document;
-    var iframes = modal.querySelectorAll('iframe');
-    for (var i = 0; i < iframes.length; i++) {
-        var r = iframes[i].getBoundingClientRect();
-        if (r.width > 0 && r.height > 0) {
-            iframes[i].style.width  = '300px';
-            iframes[i].style.height = '150px';
-            iframes[i].style.minWidth  = '300px';
-            iframes[i].style.minHeight = '150px';
-            iframes[i].style.visibility = 'visible';
-            iframes[i].style.opacity = '1';
-            var el = iframes[i];
-            for (var j = 0; j < 10; j++) {
-                el = el.parentElement;
-                if (!el) break;
-                el.style.overflow = 'visible';
-            }
-            var r2 = iframes[i].getBoundingClientRect();
-            return { cx: Math.round(r2.x + 30), cy: Math.round(r2.y + r2.height / 2) };
+var modal = document.querySelector('div.modal.show') || document;
+var iframes = modal.querySelectorAll('iframe');
+for (var i = 0; i < iframes.length; i++) {
+    var r = iframes[i].getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) {
+        iframes[i].style.width  = '300px';
+        iframes[i].style.height = '150px';
+        iframes[i].style.minWidth  = '300px';
+        iframes[i].style.minHeight = '150px';
+        iframes[i].style.visibility = 'visible';
+        iframes[i].style.opacity = '1';
+        var el = iframes[i];
+        for (var j = 0; j < 10; j++) {
+            el = el.parentElement;
+            if (!el) break;
+            el.style.overflow = 'visible';
         }
+        var r2 = iframes[i].getBoundingClientRect();
+        return { cx: Math.round(r2.x + 30), cy: Math.round(r2.y + r2.height / 2) };
     }
-    return null;
-})()
+}
+return null;
 """
 
 # 检测 ALTCHA 是否已验证通过
 _ALTCHA_SOLVED_JS = r"""
-(function(){
-    var modal = document.querySelector('div.modal.show') || document;
-    // hidden input 有值
-    var inputs = modal.querySelectorAll('input[type="hidden"]');
-    for (var i = 0; i < inputs.length; i++) {
-        var n = (inputs[i].name || '').toLowerCase();
-        if ((n.includes('altcha') || n.includes('captcha')) &&
-            inputs[i].value && inputs[i].value.length > 20) return {ok:true, why:'hidden-input'};
-    }
-    var w = modal.querySelector('[data-state="verified"],.altcha--verified,.altcha-verified');
-    if (w) return {ok:true, why:'data-state'};
-    var state = modal.querySelector('altcha-widget [data-state], .altcha[data-state], [data-state]');
-    return {ok:false, why:(state && state.getAttribute('data-state')) || ''};
-})()
+var modal = document.querySelector('div.modal.show') || document;
+var inputs = modal.querySelectorAll('input[type="hidden"]');
+for (var i = 0; i < inputs.length; i++) {
+    var n = (inputs[i].name || '').toLowerCase();
+    if ((n.includes('altcha') || n.includes('captcha')) &&
+        inputs[i].value && inputs[i].value.length > 20) return {ok:true, why:'hidden-input'};
+}
+var w = modal.querySelector('[data-state="verified"],.altcha--verified,.altcha-verified');
+if (w) return {ok:true, why:'data-state'};
+var state = modal.querySelector('altcha-widget [data-state], .altcha[data-state], [data-state]');
+return {ok:false, why:(state && state.getAttribute('data-state')) || ''};
 """
 
 # 输出模态框内 ALTCHA 相关的 DOM 诊断信息
 _ALTCHA_DIAG_JS = r"""
-(function(){
-    var modal = document.querySelector('div.modal.show') || document;
-    var out = {hidden:[], buttons:[], state:null, widget:null, forms:0};
-    modal.querySelectorAll('input[type="hidden"]').forEach(function(i){
-        var n = (i.name || '').toLowerCase();
-        if (n.indexOf('altcha') > -1 || n.indexOf('captcha') > -1)
-            out.hidden.push({name:i.name || i.id || '?', len:(i.value || '').length});
-    });
-    modal.querySelectorAll('button').forEach(function(b){
-        out.buttons.push({t:(b.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
-                          dis:!!b.disabled, type:(b.type || '')});
-    });
-    var w = modal.querySelector('altcha-widget, [data-state], .altcha');
-    if (w) {
-        out.state = w.getAttribute('data-state');
-        out.widget = (w.outerHTML || '').replace(/\s+/g, ' ').slice(0, 500);
-    }
-    out.forms = modal.querySelectorAll('form').length;
-    return out;
-})()
+var modal = document.querySelector('div.modal.show') || document;
+var out = {hidden:[], buttons:[], state:null, widget:null, forms:0};
+modal.querySelectorAll('input[type="hidden"]').forEach(function(i){
+    var n = (i.name || '').toLowerCase();
+    if (n.indexOf('altcha') > -1 || n.indexOf('captcha') > -1)
+        out.hidden.push({name:i.name || i.id || '?', len:(i.value || '').length});
+});
+modal.querySelectorAll('button').forEach(function(b){
+    out.buttons.push({t:(b.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60),
+                      dis:!!b.disabled, type:(b.type || '')});
+});
+var w = modal.querySelector('altcha-widget, [data-state], .altcha');
+if (w) {
+    out.state = w.getAttribute('data-state');
+    out.widget = (w.outerHTML || '').replace(/\s+/g, ' ').slice(0, 500);
+}
+out.forms = modal.querySelectorAll('form').length;
+return out;
 """
 
 
@@ -330,19 +317,17 @@ _ALTCHA_DIAG_JS = r"""
 def js_fill_input(sb, selector: str, text: str):
     safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
     sb.execute_script(f"""
-    (function(){{
-        var el = document.querySelector('{selector}');
-        if (!el) return;
-        var descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value") ||
-                         Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
-        if (descriptor && descriptor.set) {{
-            descriptor.set.call(el, "{safe_text}");
-        }} else {{
-            el.value = "{safe_text}";
-        }}
-        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-    }})()
+    var el = document.querySelector('{selector}');
+    if (!el) return;
+    var descriptor = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value") ||
+                     Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value");
+    if (descriptor && descriptor.set) {{
+        descriptor.set.call(el, "{safe_text}");
+    }} else {{
+        el.value = "{safe_text}";
+    }}
+    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
     """)
 
 def _activate_window():
@@ -393,10 +378,8 @@ def _human_warmup(sb):
     # 滚动页面制造 wheel 事件
     try:
         sb.execute_script("""
-            (function(){
-                window.scrollBy(0, 150);
-                setTimeout(function(){ window.scrollBy(0, -150); }, 400);
-            })()
+            window.scrollBy(0, 150);
+            setTimeout(function(){ window.scrollBy(0, -150); }, 400);
         """)
     except Exception:
         pass
@@ -430,7 +413,6 @@ def _switch_to_turnstile_frame(sb):
     """切入页面上的 Turnstile iframe，返回是否成功。"""
     try:
         el = sb.driver.execute_script("""
-        (function(){
             var frames = document.querySelectorAll('iframe');
             for (var i = 0; i < frames.length; i++){
                 var f = frames[i], s = f.src || '';
@@ -441,7 +423,6 @@ def _switch_to_turnstile_frame(sb):
                 '[class*="cf-turnstile"], [id*="turnstile"]');
             if (q){ var qf = q.querySelector('iframe'); if (qf) return qf; }
             return null;
-        })()
         """)
         if el is None:
             return False
@@ -553,7 +534,6 @@ def handle_turnstile(sb) -> bool:
             continue
         try:
             cb = sb.driver.execute_script("""
-            (function(){
                 var cands = document.querySelectorAll(
                     '[role="checkbox"], input[type="checkbox"],'+
                     '[class*="checkbox"], [class*="btn-check"]'
@@ -563,7 +543,6 @@ def handle_turnstile(sb) -> bool:
                     if (r.width > 0 && r.height > 0) return e;
                 }
                 return null;
-            })()
             """)
             if cb is not None:
                 sb.driver.execute_script(
@@ -839,11 +818,9 @@ def _open_renew_modal(sb) -> bool:
             return False
 
     sb.execute_script("""
-        (function(){
-            var btn = document.querySelector('button[data-bs-target="#renew-modal"]')
-                     || document.querySelector('button.btn.btn-outline-primary');
-            if (btn) btn.scrollIntoView({behavior:'smooth',block:'center'});
-        })()
+        var btn = document.querySelector('button[data-bs-target="#renew-modal"]')
+                 || document.querySelector('button.btn.btn-outline-primary');
+        if (btn) btn.scrollIntoView({behavior:'smooth',block:'center'});
     """)
     time.sleep(0.8)
     renew_btn.click()
@@ -863,9 +840,7 @@ def _renew_not_due(sb) -> bool:
     """The site exposes the renewal window even when its modal can be opened."""
     try:
         body = sb.execute_script(r"""
-            (function(){
-                return document.body.innerText || '';
-            })()
+            return document.body.innerText || '';
         """) or ""
 
         low = body.lower()
@@ -964,31 +939,29 @@ def _solve_altcha(sb) -> bool:
 
         # 策略 3: JS 遍历模态框内所有可点击元素
         sb.execute_script("""
-            (function(){
-                var modal = document.querySelector('div.modal.show');
-                if (!modal) return;
-                // 点击 iframe
-                var iframes = modal.querySelectorAll('iframe');
-                for (var i = 0; i < iframes.length; i++) {
-                    iframes[i].click();
-                    iframes[i].dispatchEvent(new MouseEvent('click', {bubbles:true}));
+            var modal = document.querySelector('div.modal.show');
+            if (!modal) return;
+            // 点击 iframe
+            var iframes = modal.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+                iframes[i].click();
+                iframes[i].dispatchEvent(new MouseEvent('click', {bubbles:true}));
+            }
+            // 点击含 checkbox 的 label
+            var labels = modal.querySelectorAll('label');
+            for (var j = 0; j < labels.length; j++) {
+                var txt = (labels[j].textContent || '').toLowerCase();
+                if (txt.includes('robot') || txt.includes('captcha') || txt.includes('verify'))
+                    labels[j].click();
+            }
+            // 点击 checkbox
+            var cbs = modal.querySelectorAll('input[type="checkbox"]');
+            for (var k = 0; k < cbs.length; k++) {
+                if (!cbs[k].disabled) {
+                    cbs[k].click();
+                    cbs[k].dispatchEvent(new MouseEvent('click', {bubbles:true}));
                 }
-                // 点击含 checkbox 的 label
-                var labels = modal.querySelectorAll('label');
-                for (var j = 0; j < labels.length; j++) {
-                    var txt = (labels[j].textContent || '').toLowerCase();
-                    if (txt.includes('robot') || txt.includes('captcha') || txt.includes('verify'))
-                        labels[j].click();
-                }
-                // 点击 checkbox
-                var cbs = modal.querySelectorAll('input[type="checkbox"]');
-                for (var k = 0; k < cbs.length; k++) {
-                    if (!cbs[k].disabled) {
-                        cbs[k].click();
-                        cbs[k].dispatchEvent(new MouseEvent('click', {bubbles:true}));
-                    }
-                }
-            })()
+            }
         """)
 
         # 等待验证结果
@@ -1016,12 +989,10 @@ def _read_expiry(sb) -> str:
     """Read the current server expiry, used as a submit-independent result check."""
     try:
         return sb.execute_script(r"""
-            (function(){
-                var m = (document.body.innerText || '').match(
-                    /Expiry\s*(?:\n\s*|:\s*)(\d{4}-\d{2}-\d{2})/
-                );
-                return m ? m[1] : '';
-            })()
+            var m = (document.body.innerText || '').match(
+                /Expiry\s*(?:\n\s*|:\s*)(\d{4}-\d{2}-\d{2})/
+            );
+            return m ? m[1] : '';
         """) or ""
     except Exception:
         return ""
@@ -1042,66 +1013,56 @@ def _submit_renew(sb) -> bool:
     action = ""
     try:
         state = sb.execute_script(r"""
-            (function(){
-                var m = document.querySelector('div.modal.show');
-                if (!m) return {modal:false};
-                var f = m.querySelector('form');
-                var token = m.querySelector(
-                    'input[type="hidden"][name="altcha"], input[name="altcha"]'
-                );
-                var button = m.querySelector('button[type="submit"]') ||
-                             m.querySelector('button.btn-primary');
-                return {
-                    modal:true,
-                    form:!!f,
-                    token:!!(token && token.value),
-                    button:!!button,
-                    enabled:!!(button && !button.disabled),
-                    text:((button && button.textContent) || '').trim()
-                };
-            })()
+            var m = document.querySelector('div.modal.show');
+            if (!m) return {modal:false};
+            var f = m.querySelector('form');
+            var token = m.querySelector(
+                'input[type="hidden"][name="altcha"], input[name="altcha"]'
+            );
+            var button = m.querySelector('button[type="submit"]') ||
+                         m.querySelector('button.btn-primary');
+            return {
+                modal:true,
+                form:!!f,
+                token:!!(token && token.value),
+                button:!!button,
+                enabled:!!(button && !button.disabled),
+                text:((button && button.textContent) || '').trim()
+            };
         """) or {}
 
         if state.get("modal") and state.get("form") and state.get("token"):
-            sb.execute_script(r"""
-                (function(){
-                    var m = document.querySelector('div.modal.show');
-                    var f = m && m.querySelector('form');
-                    if (f) f.submit();
-                })()
+            sb.execute_script("""
+                var m = document.querySelector('div.modal.show');
+                var f = m && m.querySelector('form');
+                if (f) f.submit();
             """)
             action = "submitted-token"
         elif state.get("modal") and state.get("button") and state.get("enabled"):
-            sb.execute_script(r"""
-                (function(){
-                    var m = document.querySelector('div.modal.show');
-                    var b = m.querySelector('button[type="submit"]') ||
-                            m.querySelector('button.btn-primary');
-                    if (b) b.click();
-                })()
+            sb.execute_script("""
+                var m = document.querySelector('div.modal.show');
+                var b = m.querySelector('button[type="submit"]') ||
+                        m.querySelector('button.btn-primary');
+                if (b) b.click();
             """)
             action = "clicked-submit"
             # Let the ALTCHA auto=onsubmit handler verify and resubmit itself.
             for _ in range(20):
                 time.sleep(1)
                 now = sb.execute_script(r"""
-                    (function(){
-                        var m = document.querySelector('div.modal.show');
-                        if (!m) return {modal:false};
-                        var f = m.querySelector('form');
-                        var token = m.querySelector('input[name="altcha"]');
-                        return {modal:true, form:!!f, token:!!(token && token.value)};
-                    })()
+                    var m = document.querySelector('div.modal.show');
+                    if (!m) return {modal:false};
+                    var f = m.querySelector('form');
+                    var token = m.querySelector('input[name="altcha"]');
+                    return {modal:true, form:!!f, token:!!(token && token.value)};
                 """) or {}
                 if not now.get("modal"):
                     break
                 if now.get("form") and now.get("token"):
-                    sb.execute_script(r"""
-                        (function(){
-                            var m = document.querySelector('div.modal.show');
-                            var f = m && m.querySelector('form');
-                            if (f) f.submit();
-                        })()
+                    sb.execute_script("""
+                        var m = document.querySelector('div.modal.show');
+                        var f = m && m.querySelector('form');
+                        if (f) f.submit();
                     """)
                     action = "submitted-after-altcha"
                     break
@@ -1134,12 +1095,10 @@ def _confirm_server_type_warning(sb) -> bool:
     """
     try:
         state = sb.execute_script("""
-            (function(){
-                var m = document.querySelector('div.modal.show, div[role="dialog"]');
-                if (!m) return {visible:false, text:''};
-                var r = m.getBoundingClientRect();
-                return {visible:r.width > 0 && r.height > 0, text:(m.innerText||'').trim()};
-            })()
+            var m = document.querySelector('div.modal.show, div[role="dialog"]');
+            if (!m) return {visible:false, text:''};
+            var r = m.getBoundingClientRect();
+            return {visible:r.width > 0 && r.height > 0, text:(m.innerText||'').trim()};
         """)
     except Exception:
         return False
@@ -1150,18 +1109,16 @@ def _confirm_server_type_warning(sb) -> bool:
     print("⚠️ 检测到可见的 server type 确认框...")
     sb.save_screenshot("renew_warn_before_confirm.png")
     clicked = sb.execute_script("""
-        (function(){
-            var m = document.querySelector('div.modal.show, div[role="dialog"]');
-            if (!m) return false;
-            var re = /confirm|continue|yes|ok|确定|确认|继续|更换/;
-            for (var b of m.querySelectorAll('button')) {
-                var t = (b.textContent||'').trim().toLowerCase();
-                if (!b.disabled && re.test(t) && !/^renew$/.test(t)) {
-                    b.click(); return true;
-                }
+        var m = document.querySelector('div.modal.show, div[role="dialog"]');
+        if (!m) return false;
+        var re = /confirm|continue|yes|ok|确定|确认|继续|更换/;
+        for (var b of m.querySelectorAll('button')) {
+            var t = (b.textContent||'').trim().toLowerCase();
+            if (!b.disabled && re.test(t) && !/^renew$/.test(t)) {
+                b.click(); return true;
             }
-            return false;
-        })()
+        }
+        return false;
     """)
     if clicked:
         print("  ✅ 已点击 server type 确认按钮")
@@ -1176,21 +1133,19 @@ def _visible_renew_feedback(sb):
     """Return visible success/error feedback, excluding stale background alerts."""
     try:
         return sb.execute_script("""
-            (function(){
-                var selectors = ['div.modal.show', 'div[role="dialog"]',
-                                 '.alert', '.toast', '.swal2-container'];
-                var out=[];
-                selectors.forEach(function(sel){
-                    document.querySelectorAll(sel).forEach(function(el){
-                        var r=el.getBoundingClientRect(), s=getComputedStyle(el);
-                        if (r.width && r.height && s.visibility !== 'hidden' && s.display !== 'none') {
-                            var t=(el.innerText||'').trim();
-                            if (t && !out.includes(t)) out.push(t);
-                        }
-                    });
+            var selectors = ['div.modal.show', 'div[role="dialog"]',
+                             '.alert', '.toast', '.swal2-container'];
+            var out=[];
+            selectors.forEach(function(sel){
+                document.querySelectorAll(sel).forEach(function(el){
+                    var r=el.getBoundingClientRect(), s=getComputedStyle(el);
+                    if (r.width && r.height && s.visibility !== 'hidden' && s.display !== 'none') {
+                        var t=(el.innerText||'').trim();
+                        if (t && !out.includes(t)) out.push(t);
+                    }
                 });
-                return out.join('\\n');
-            })()
+            });
+            return out.join('\\n');
         """) or ""
     except Exception:
         return ""
