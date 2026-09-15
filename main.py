@@ -6,7 +6,7 @@ import json
 import re
 import time
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 import argparse
 import requests
 
@@ -933,12 +933,6 @@ def renew_server(sb) -> bool:
 
     if not _goto_server_detail(sb):
         return False
-
-    if _renew_not_due(sb):
-        sb.save_screenshot("renew_not_due.png")
-        print("ℹ️ 服务器尚未进入可续期窗口，跳过 Renew 提交")
-        send_tg_message("⏳", "未到续期时间", "服务器当前不在可续期窗口内")
-        return True
 
     if not _open_renew_modal(sb):
         return False
